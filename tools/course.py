@@ -1,15 +1,16 @@
-"""Compile the coast circuit into Spectrum screen tiles and forward-only road updates."""
+"""Compile a circuit into Spectrum screen tiles and forward-only road updates."""
 
 from collections import Counter
 from functools import lru_cache
-from math import cos, pi, sin
+from math import cos, sin
 from pathlib import Path
 from struct import pack
 
+from route import DASH, STEPS, TOP, TYRES, at_distance, drift, profile, projection
 
 WIDTH, HEIGHT = 256, 192
-HORIZON, DASH = 64, 168
-STEPS, PHASES = 64, 32
+PHASES = 32
+TRAVEL_PER_STEP = 40
 TOP_TILES, BOTTOM_TILES = 23, 6
 BATCH_TILES = TOP_TILES + BOTTOM_TILES
 PAGES = (0, 1, 3, 4, 6)
@@ -30,6 +31,8 @@ TITLE = {letter: bytes.fromhex(rows) for letter, rows in {
     "C": "0f 10 10 10 10 10 0f", "O": "0e 11 11 11 11 11 0e",
     "A": "0e 11 11 1f 11 11 11", "S": "0f 10 10 0e 01 01 1e",
     "T": "1f 04 04 04 04 04 04", "R": "1e 11 11 1e 14 12 11",
+    "I": "1f 04 04 04 04 04 1f", "D": "1e 11 11 11 11 11 1e",
+    "G": "0f 10 10 17 11 11 0f", "E": "1f 10 10 1e 10 10 1f",
     "U": "11 11 11 11 11 11 0e", "N": "11 19 19 15 13 13 11",
 }.items()}
 
@@ -50,22 +53,31 @@ def span(row, left, right, material):
         row[left:right] = bytes([material]) * (right - left)
 
 
-def scenery():
+def scenery(course="coast"):
     pic = [bytearray(WIDTH) for _ in range(HEIGHT)]
-    for y in range(HORIZON):
+    for y in range(64):
         for x in range(WIDTH):
             # Sunset over two silhouettes, with a coastal radio mast on the ridge.
             colour = 0
             if (x-174)**2 + (y-34)**2 <= 24**2 and (y < 32 or y % 5 < 3):
                 colour = 14 if y < 24 else 10 if y < 40 else 11
             ridge = 51 + 5*sin(x/14) + 4*cos(x/22) - 5*abs(sin(x/8))
+            if course == "ridge":
+                ridge = 53 - max(0, 25-abs(x-75)*.72, 33-abs(x-107)*.85, 23-abs(x-206)*.64)
             if y >= ridge:
                 colour = 3
+            if course == "ridge" and ridge < 37 and ridge <= y < ridge + 3:
+                colour = 7
             if y >= 56 + 4*sin(x/25) - 2*abs(sin(x/5)):
                 colour = 1
             if y == 63:
                 colour = 13
             pic[y][x] = STATIC + colour
+    # The sea and its distant headland appear below the mountains on a descent.
+    for y in range(64, DASH):
+        for x in range(WIDTH):
+            headland = y < 68 + 6*cos(x/72) + 2*sin(x/17)
+            pic[y][x] = STATIC + (1 if headland else (4 if course == "ridge" else 5))
     for x, y in [(12, 17), (37, 9), (49, 31), (68, 15), (93, 7),
                  (117, 27), (131, 12), (212, 11), (237, 25), (225, 36)]:
         pic[y][x] = STATIC + 7
@@ -78,7 +90,7 @@ def scenery():
     for y in (169, 189):
         span(pic[y], 104, 248, STATIC + 1)
     x = 7
-    for letter in "COAST RUN":
+    for letter in ("COAST RUN" if course == "coast" else "RIDGE RUN"):
         if letter == " ":
             x += 3
             continue
@@ -98,91 +110,133 @@ def scenery():
     return pic
 
 
-def halfwidth(d):
-    return 5 + d * 1.05
+@lru_cache(maxsize=2)
+def background(course):
+    return tuple(bytes(row) for row in scenery(course)[:DASH])
 
 
-def centre(step, d):
-    bend = sin(2*pi*step/STEPS)
-    return 128 + round(60 * bend * (1 - d / (DASH-HORIZON))**2)
-
-
-def kerb_width(d):
-    return 6 + round(30 * d / (DASH - HORIZON - 1))
-
-
-def kerb_starts(step, first_depth, side):
-    """Project eight scanlines of one stripe, keeping its two edges in separate cells."""
-    spans = []
-    for d in range(first_depth, first_depth + 8):
-        width = kerb_width(d)
-        inner = round(centre(step, d) + side * halfwidth(d))
-        start = inner - width if side < 0 else inner + 1
-        spans.append((start, start + width))
-    # Pick the cell boundary nearest the overlap of the eight projected spans.
-    # On a tight distant bend, move only the rows that would miss it. The
-    # stripe retains its full width and no cell needs green, paint and black.
-    latest_start = max(lo for lo, _ in spans)
-    earliest_end = min(hi for _, hi in spans)
-    seam = 8 * round((latest_start + earliest_end) / 16)
-    return [max(seam - (hi - lo), min(lo, seam)) for lo, hi in spans]
-
-
-def road(pic, step):
-    for first in range(0, DASH-HORIZON, 8):
-        left = kerb_starts(step, first, -1)
-        right = kerb_starts(step, first, 1)
-        for line, (lo, hi) in enumerate(zip(left, right)):
-            d = first + line
-            row = pic[HORIZON + d]
-            row[:] = bytes([GRASS]) * WIDTH
-            width = kerb_width(d)
-            span(row, lo, lo + width, KERB)
-            span(row, lo + width, hi, ASPHALT)
-            span(row, hi, hi + width, KERB)
+@lru_cache(maxsize=None)
+def edges(step, course):
+    """Separate the kerb edges within each ULA band, independently across a crest."""
+    rows = projection(step, course)[1]
+    result = [None] * len(rows)
+    for band in range(0, len(rows), 8):
+        start = band
+        while start < band+8:
+            if rows[start] is None:
+                start += 1
+                continue
+            end = start+1
+            while end < band+8 and rows[end] and rows[end-1].z - rows[end].z < 3:
+                end += 1
+            sides = []
             for side in (-1, 1):
-                mark = round(centre(step, d) + side * halfwidth(d) * 0.36)
-                span(row, max(lo + width + 1, mark), min(hi - 1, mark + 1 + d//58), PAINT)
+                spans = []
+                for r in rows[start:end]:
+                    inner = round(r.x + side*r.halfwidth)
+                    lo = inner - r.kerb if side < 0 else inner + 1
+                    spans.append((lo, lo+r.kerb))
+                seam = 8 * round((max(lo for lo, _ in spans) + min(hi for _, hi in spans))/16)
+                # Keep tight downhill bends on their projected path even when
+                # the kerb crosses several character columns in eight lines.
+                offsets = [max(seam-hi, min(0, seam-lo)) for lo,hi in spans]
+                sides.append([lo + max(-5, min(5, offset)) for (lo,_),offset in zip(spans,offsets)])
+            result[start:end] = list(zip(*sides))
+            start = end
+    return result
 
-    # Two sets of roadside bollards, planted at equal world-space intervals.
-    for distance in sorted(((1-(step/16 + offset) % 1) for offset in (0, 0.5)), reverse=True):
-        d = round(8/(distance+0.065))
-        if d >= DASH-HORIZON:
+
+def visible(rows, y, z):
+    return TOP <= y < DASH and (rows[y-TOP] is None or rows[y-TOP].z >= z-.04)
+
+
+def road(pic, step, course="coast"):
+    samples, rows = projection(step, course)
+    for i, (r, pair) in enumerate(zip(rows, edges(step, course))):
+        row = pic[TOP+i]
+        if r is None:
+            row[:] = background(course)[TOP+i]
             continue
-        for sign in (-1, 1):
-            verge = halfwidth(d) + kerb_width(d)
-            # Keep the post and its whole sign clear of the grass/kerb cells.
-            x = round(centre(step,d) + sign*(verge + 24 + d//8))
-            h, w = max(2, d//5), max(1, d//28)
-            for dy in range(h):
-                span(pic[HORIZON+d-dy], x-w, x+w, RUBY if dy >= h*0.65 else STEEL)
-            # Black-on-yellow bend board faces the approaching rider.
-            direction = 1 if step < STEPS//2 else -1
-            if d >= 18 and sign == -direction:
-                top = HORIZON+d-h
-                radius = max(2,d//12)
-                for dy in range(-radius//2, radius//2+1):
-                    line = pic[top+dy]
-                    span(line,x-radius,x+radius+1,LAMP)
-                    tip = x + direction*(radius//3-abs(dy))
-                    span(line,tip-1,tip+1,VOID)
+        lo, hi = pair
+        row[:] = bytes([GRASS]) * WIDTH
+        span(row, lo, lo+r.kerb, KERB)
+        span(row, lo+r.kerb, hi, ASPHALT)
+        span(row, hi, hi+r.kerb, KERB)
+        for side in (-1, 1):
+            mark = round(r.x + side*r.halfwidth*.36)
+            span(row, max(lo+r.kerb+1, mark), min(hi-1, mark+1+int(r.z<2.3)), PAINT)
 
-    # A slower rider ahead. Alternate passing sides on successive encounters.
-    t = step % 32
-    d = round(9/(1-t/34))
-    x = round(centre(step,d) + (-1 if step < 32 else 1)*halfwidth(d)*0.48)
-    h = max(3, round(d*0.26))
-    foot = HORIZON + d
-    for dy in range(h):
-        row = pic[foot-h+dy]
-        sy = (dy*24+12)//h
-        for dx in range(h):
-            shape = BIKE[min(23,sy)][min(23,(dx*24+12)//h)]
-            if shape == "#":
-                row[x-h//2+dx] = LAMP if sy<6 else TEAL if sy<16 else STEEL
-            elif shape == ".":
-                row[x-h//2+dx] = ASPHALT
-    return x, foot
+    # World-space objects use the same depth and elevation as their road.
+    # Test each object scanline so a nearer crest can hide its lower half.
+    actors = []
+    for station in range(2, STEPS, 6):
+        z = (station-step) % STEPS
+        if TYRES <= z <= 16:
+            actors.append((z, station))
+    rival_z = TYRES + (31-step%32)*.42
+    actors.append((rival_z, None))
+    rival_x = rival_y = 0
+    for z, station in sorted(actors, key=lambda a: -a[0]):
+        r = at_distance(samples, z)
+        foot = round(r.y)
+        if station is None:
+            rival_x = round(r.x + (-1 if step<32 else 1)*r.halfwidth*.48)
+            rival_y = foot
+            h = max(3, round(31/z))
+            for dy in range(h):
+                y = foot-h+dy
+                if not visible(rows, y, z):
+                    continue
+                sy = min(23, (dy*24+12)//h)
+                for dx in range(h):
+                    x = rival_x-h//2+dx
+                    if not 0 <= x < WIDTH:
+                        continue
+                    shape = BIKE[sy][min(23, (dx*24+12)//h)]
+                    if shape == "#":
+                        pic[y][x] = LAMP if sy<6 else TEAL if sy<16 else STEEL
+                    elif shape == ".":
+                        pic[y][x] = ASPHALT
+            continue
+        direction = 1 if profile(station, course)[1] > 0 else -1
+        for side in (-1, 1):
+            x = round(r.x + side*(r.halfwidth+r.kerb+10+20/z))
+            if course == "coast" and station in (8, 38) and side == -1:
+                # A red-banded navigation tower with a lit lantern.
+                height = round(85/z)
+                for dy in range(height):
+                    y = foot-dy
+                    if visible(rows, y, z):
+                        w = max(1, round((12-5*dy/height)/z))
+                        ink = LAMP if dy > .85*height else RUBY if .38*height < dy < .63*height else STEEL
+                        span(pic[y], x-w, x+w+1, ink)
+                continue
+            if course == "ridge" and station % 12 == 2:
+                # Three overlapping whorls give the pines a readable silhouette.
+                height = round(63/z)
+                for dy in range(height):
+                    y = foot-dy
+                    if visible(rows, y, z):
+                        t = dy/height
+                        whorl = max((tip-t for base,tip in ((.12,.72),(.38,.86),(.61,1))
+                                     if t >= base), default=0)
+                        w = max(1, round(19*whorl/z))
+                        span(pic[y], x-w, x+w+1, STATIC+1 if whorl else VOID)
+                continue
+            h, w = max(2,round(26/z)), max(1,round(3/z))
+            for dy in range(h):
+                y = foot-dy
+                if visible(rows,y,z):
+                    span(pic[y], x-w,x+w, RUBY if dy>h*.65 else STEEL)
+            if z < 9 and side == -direction:
+                radius = max(2,round(12/z))
+                for dy in range(-radius//2,radius//2+1):
+                    y = foot-h+dy
+                    if visible(rows,y,z):
+                        span(pic[y],x-radius,x+radius+1,LAMP)
+                        tip = x+direction*(radius//3-abs(dy))
+                        span(pic[y],tip-1,tip+1,VOID)
+    return rival_x, rival_y
 
 
 def bitmap_offset(y, col):
@@ -231,19 +285,41 @@ def screen(scene, bank):
     return out
 
 
-def pack_page(steps):
-    tileset = {}
+# Fixed-bank tiles can be read with any course page mapped at #C000.
+SHARED_FAST, FAST_COUNT = 0x9800, 940
+SHARED_LOW, LOW_COUNT = 0x6000, 400
+DEPTH_BANK7 = 0xe000
+
+
+def pack_page(steps, shared):
+    local = {}
     for _, delta in steps:
         for _, tile in delta:
-            tileset.setdefault(tile, len(tileset)*10)
-    data = bytearray(b"".join(tileset))
+            if tile not in shared:
+                local.setdefault(tile, 0xc000 + len(local)*10)
+    data = bytearray(b"".join(local))
     offsets = []
     for _, delta in steps:
         offsets.append(len(data))
-        for n, tile in delta:
-            data += pack("<HH", 0x5800+n, 0xc000+tileset[tile])
-        # Fixed-size batches let the pre-display blitter run in constant time.
-        data += data[-4:] * (-len(delta) % BATCH_TILES)
+        batches = (len(delta)+BATCH_TILES-1)//BATCH_TILES
+        first = 0
+        for batch in range(batches):
+            jobs = delta[batch*BATCH_TILES:(batch+1)*BATCH_TILES]
+            # Advance the stripe projection alongside the top-to-bottom tile
+            # sweep. Bound the copy time, even on a step with a long empty sky.
+            remaining = batches-batch-1
+            last_line = (jobs[-1][0]//32+1)*8 - TOP
+            lower = max(first+1, DASH-TOP-32*remaining)
+            upper = min(first+32, DASH-TOP-remaining)
+            if lower > upper:
+                raise ValueError("Course batch cannot refresh its depth map in time")
+            stop = min(upper, max(lower,last_line))
+            data.extend((first,stop-first))
+            first = stop
+            for n, tile in jobs:
+                addr = shared[tile] if tile in shared else local[tile]
+                data += pack("<HH", 0x5800+n, addr)
+            data += data[-4:] * (BATCH_TILES-len(jobs))
     return data, offsets
 
 
@@ -281,41 +357,55 @@ def riders():
     return out
 
 
-def generate(out: Path):
-    pic = scenery()
+def generate(out: Path, course):
+    pic = scenery(course)
     states, encounters = [], []
     for step in range(STEPS):
-        encounters.append(road(pic, step))
+        encounters.append(road(pic, step, course))
         states.append(tiles(pic))
     for bank in range(2):
         (out/f"screen{bank}.bin").write_bytes(screen(states[0], bank))
-    groups = [[]]
+    deltas = [(i, [(n,t) for n,t in enumerate(state) if t != states[i-1][n]])
+              for i,state in enumerate(states)]
+    counts = Counter(tile for _,delta in deltas for _,tile in delta)
+    common = [tile for tile,_ in counts.most_common(FAST_COUNT+LOW_COUNT)]
+    shared = {}
+    for base, name, bank_tiles in ((SHARED_FAST,"fast",common[:FAST_COUNT]),
+                                   (SHARED_LOW,"low",common[FAST_COUNT:])):
+        (out/f"shared-{name}.bin").write_bytes(b"".join(bank_tiles))
+        shared.update((tile,base+10*i) for i,tile in enumerate(bank_tiles))
+
+    groups = [[] for page in PAGES]
+    for i, delta in deltas:
+        if not 0 < len(delta) <= BATCH_TILES*(TRAVEL_PER_STEP//4):
+            raise ValueError(f"Step {i}: {len(delta)} tiles exceed the top-gear update window")
+    # Descriptors address each pose independently. Place the largest pose
+    # first and account for the dictionary entries it shares with each bank.
+    for pose in sorted(deltas, key=lambda p: len(pack_page([p],shared)[0]), reverse=True):
+        size,index = min((len(pack_page(group+[pose],shared)[0]),index)
+                         for index,group in enumerate(groups))
+        if size > 16384:
+            raise ValueError("Course exceeds the five available 16K banks")
+        groups[index].append(pose)
+    groups = [group for group in groups if group]
+
     descriptors = [None] * STEPS
-    # Entering and leaving a bend reuse many of the same edge bitmaps. Keep
-    # those poses in one bank; the descriptor table remains in driving order.
-    for i in sorted(range(STEPS), key=lambda step: centre(step, 0)):
-        state = states[i]
-        delta = [(n,tile) for n,tile in enumerate(state) if tile != states[i-1][n]]
-        if not 0 < len(delta) <= BATCH_TILES*6:
-            raise ValueError(f"Step {i}: {len(delta)} dirty tiles exceed the top-gear update window")
-        if len(pack_page(groups[-1]+[(i,delta)])[0]) > 16384:
-            groups.append([])
-        groups[-1].append((i,delta))
-    if len(groups) > len(PAGES):
-        raise ValueError("Course exceeds the five available 16K banks")
     for page, steps in zip(PAGES, groups):
-        data, offsets = pack_page(steps)
+        data, offsets = pack_page(steps,shared)
         (out/f"page{page}.bin").write_bytes(data)
         for (i,delta), offset in zip(steps, offsets):
-            x, foot = encounters[i]
             batches = (len(delta)+BATCH_TILES-1)//BATCH_TILES
-            descriptors[i] = f"    db {page}, {batches}, {x}, {min(foot,255)}\n    dw {0xc000+offset}"
+            x = max(0, min(255, encounters[i][0]))
+            descriptors[i] = (f"    db {page}, {batches}, {x}, {drift(i,course) & 255}\n"
+                              f"    dw {0xc000+offset}, {DEPTH_BANK7 + i*(DASH-TOP)}")
     (out/"course.inc").write_text("\n".join(descriptors)+"\n")
     (out/"riders.bin").write_bytes(riders())
-    (out/"road-phases.bin").write_bytes(bytes(
-        0x1f if (int(4000/(y-HORIZON+5)) + phase) % PHASES >= PHASES//2 else 0x17
-        for phase in range(PHASES) for y in range(HORIZON,DASH)))
-    (out/"layout.inc").write_text(f"HORIZON equ {HORIZON}\nDASH equ {DASH}\n"
-                                  f"TOP_TILES equ {TOP_TILES}\nBOTTOM_TILES equ {BOTTOM_TILES}\n"
-                                  "BATCH_TILES equ TOP_TILES + BOTTOM_TILES\n")
+    depths = bytes(64 if r is None else int(r.z*TRAVEL_PER_STEP) % PHASES
+                   for i in range(STEPS) for r in projection(i,course)[1])
+    if DEPTH_BANK7+len(depths) > 0x10000:
+        raise ValueError("Depth maps exceed screen bank 7")
+    (out/"depths.bin").write_bytes(depths)
+    (out/"layout.inc").write_text(f"RASTER_TOP equ {TOP}\nDASH equ {DASH}\nTRAVEL_PER_STEP equ {TRAVEL_PER_STEP}\n"
+                                  f"SHARED_FAST equ {SHARED_FAST}\nTOP_TILES equ {TOP_TILES}\n"
+                                  f"BOTTOM_TILES equ {BOTTOM_TILES}\nBATCH_TILES equ TOP_TILES + BOTTOM_TILES\n")
     return PAGES[:len(groups)]

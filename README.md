@@ -1,12 +1,17 @@
-# Coast Run
+# Spectrum Attribute Racer
 
-A playable ZX Spectrum 128K motorcycle racer. Follow the flat coast road, countersteer through the bends and pass the other rider. Contact or running wide drops the bike to first gear. Each clean overtake adds one to the dashboard counter.
+Two motorcycle circuits for the ZX Spectrum 128K. Countersteer through bends, watch for riders coming back into view over crests, and pass on either side. Contact or running wide drops the bike to first gear. Each clean overtake adds one to the dashboard counter.
 
-![Coast Run playing in ZEsarUX](docs/coast-run.gif)
+| Circuit | Ride | Emulator capture |
+| --- | --- | --- |
+| [Coast Run](play/coast-run.tap) | Climb the headland past the beacons, drop into a hooked ravine, then cross the low causeway before the paired summit bends. | [Watch a lap](docs/coast-run.gif) |
+| [Ridge Run](play/ridge-run.tap) | Follow the pines into a steep switchback climb. The road disappears over a blind summit, opens into a downhill S-bend and climbs a second ridge. | [Watch a lap](docs/ridge-run.gif) |
+
+![Ridge Run riding over the mountain pass in ZEsarUX](docs/ridge-run.gif)
 
 ## Play
 
-Open [coast-run.tap](play/coast-run.tap) with tape autoload on a 128K Spectrum, +2 or +2A emulator. The bike starts rolling in second gear. Use an emulator with mid-frame shadow-screen switching enabled. In ZEsarUX this is Real Video.
+Open either TAP with tape autoload on a 128K Spectrum, +2 or +2A emulator. Enable mid-frame shadow-screen switching (Real Video in ZEsarUX). Both rides start in second gear.
 
 | Keys | Action |
 | --- | --- |
@@ -15,28 +20,28 @@ Open [coast-run.tap](play/coast-run.tap) with tape autoload on a 128K Spectrum, 
 
 ## Build and test
 
-Run these from the checkout with Python 3.10 or later. The build uses SjASMPlus. The headless tests use ZEsarUX. On the original Windows development machine both commands find the same installations as the shmup.
+Run these commands from the checkout with Python 3.10 or later. The build uses SjASMPlus. The headless tests use ZEsarUX. On the original Windows development machine both commands find the same installations as the shmup.
 
 ```powershell
 python tools/build.py
 python tools/verify.py
 ```
 
-Elsewhere pass `--assembler <path>` to the build and `--emulator <path>` to the verifier, or set `SJASMPLUS` and `ZESARUX`. The build produces `build/coast-run.tap`, an instant-start `build/coast-run.sna` and a symbol map. On Windows, `Build-TAP.bat` also rebuilds the playable image. To run one model, use e.g. `python tools/verify.py --model 128k`.
+Both commands accept `--course coast` or `--course ridge`. The verifier also accepts `--model 128k`, `--model P2` or `--model P2A41`. Set `SJASMPLUS` and `ZESARUX` to the tool paths if needed, or pass `--assembler <path>` and `--emulator <path>` respectively. The build writes a TAP, an instant-start SNA and a symbol map for each circuit in `build/` (Coast Run) and `build/ridge/` (Ridge Run). On Windows, `Build-TAP.bat` also rebuilds both.
 
 ## How the road works
 
-The starting point was the shmup's Ringo-8/Blokius renderer. Its interrupt synchronises the frame and its scheduled writes to `#7FFD` let the ULA fetch colours from either screen. Coast Run has its own raster loop, course compiler and sprite compositor. [Shmup source and timing measurements](https://github.com/johnparker007/SpectrumAttributeShmup/blob/b9f0878/docs/timing-baseline.md)
+The starting point was the shmup's Ringo-8/Blokius renderer. An interrupt synchronises the frame, and scheduled writes to `#7FFD` let the ULA fetch colours from either screen. The racer has its own raster loop, course compiler and sprite compositor. [Shmup source and timing measurements](https://github.com/johnparker007/SpectrumAttributeShmup/blob/b9f0878/docs/timing-baseline.md)
 
-* Screen banks 5 and 7 carry the same road bitmap and different attributes for grass, kerbs and lane paint. Once per road scanline, in the horizontal border, the Z80 selects the screen for the upcoming line. An inverse-depth table chooses the bank for each of 104 lines. Changing its phase each frame sends tightly spaced stripes at the horizon into broad foreground bands.
-* The kerbs taper from 6 pixels at the horizon to 36 in the foreground. In each eight-line band the kerb straddles a character-cell boundary, giving each edge its own colour pair. The bright bands have green grass, white kerbs and black asphalt with white lane dashes. The dim bands use normal green, red, blue, red and green across the screen. The lane dashes blend into the blue asphalt.
-* A 64-step looping course moves the vanishing point, projects bollards and chevron boards, and brings a slower motorcycle down each side in turn. The stripe motion and the player's lean run at the 50 Hz display rate. The current build has one course with a level horizon.
-* The rider saves the track underneath its 24×24 masked bitmap. On the dim screen it draws in normal ink over solid terrain and shares the terrain palette when crossing a two-colour edge. Once the beam passes the bike, the game restores the background, reads the keyboard and stages the next tile batch from banked course data. It writes six tiles behind the beam and the other 23 before active display after the next IM 2 interrupt.
+* Each circuit has a closed profile of elevation and signed curvature. For each of 64 rider positions, the compiler projects road sections from near to far. Each scanline takes its nearest visible surface. A crest can hide a whole valley, the lower half of a sign or an approaching rider. The distance of the visible road also sets the stripe spacing and kerb width.
+* Both screen banks hold the road bitmap. The bright bands use green grass, white kerbs and black asphalt with white lane dashes. The alternating dim bands use normal green, red, blue, red and green across the screen. The dashes blend into the blue asphalt. The kerbs reach 36 pixels at the tyres. Their edges can move up to five pixels towards an attribute boundary to reduce colour clash.
+* The Z80 selects a screen in the horizontal border before each of 128 scanlines. Sky lines select the scenic background. Road lines look up the current depth plus a phase that advances with gear at 50 Hz.
+* The rider saves the track underneath its 24×24 masked bitmap. Once the beam passes the bike, the game restores the background, reads the keyboard and stages up to 29 changed tiles. It writes six behind the beam and 23 before active display after the next IM 2 interrupt. Each batch also refreshes the corresponding scanline depths. Common tile graphics occupy fixed RAM, and five pageable banks hold the course updates.
 
-The Z80 program is in [src/racer.asm](src/racer.asm). Change the projection, scenery, riders and palette in [tools/course.py](tools/course.py).
+Edit the course profiles and projection in [tools/route.py](tools/route.py), scenery and tile conversion in [tools/course.py](tools/course.py), and the running game in [src/racer.asm](src/racer.asm).
 
 ## Timing checks
 
-The verifier runs the release TAP through the ROM loader with null video and audio drivers, then compares real-video captures against expected Spectrum pixels. Snapshot runs separately trace every road paging instruction, exercise the keyboard, cover a full lap in top gear and check clean passes and contact.
+The verifier boots both release tapes through the ROM loader and compares real-video pixels with the expected two-screen composite. Separate snapshot runs check the terrain around a full lap, keyboard controls, both overtakes, contact penalties and the time remaining before the next interrupt.
 
-Measured with SjASMPlus 1.20.2 and ZEsarUX 10.3 on the 128K, grey +2 and +2A models. All three kept 228 T-states between successive road latches and completed the lap without missing an interrupt. The first latch fell between T-states 28,924 and 28,927 relative to frame start. Timing has been checked in emulation only.
+Measured with SjASMPlus 1.20.2 and ZEsarUX 10.3 on the 128K, grey +2 and +2A emulations. The first road latch falls at T-states 23,452–23,455 relative to frame start. Successive road latches are 228 T-states apart.

@@ -7,7 +7,8 @@ import shutil
 import subprocess
 from struct import pack
 
-from course import FONT, generate
+from course import DEPTH_BANK7, FONT, SHARED_LOW, generate
+from route import COURSES
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -37,9 +38,10 @@ def basic_number(value):
     return str(value).encode() + b"\x0e\0\0" + pack("<H", value) + b"\0"
 
 
-def build(assembler, out=BUILD):
+def build(assembler, out=BUILD, course="coast"):
     out.mkdir(parents=True, exist_ok=True)
-    pages = generate(out)
+    pages = generate(out, course)
+    name = f"{course}-run"
     (out/"digits.bin").write_bytes(bytes(int(row,8)<<3 for n in range(10)
                                          for row in "0"+FONT[str(n)]+"0"))
 
@@ -49,7 +51,8 @@ def build(assembler, out=BUILD):
 
     assemble(ROOT/"src/racer.asm")
     blocks = [(0x10, 0x8000, "core.bin"), (0x10, 0x4000, "screen0.bin"),
-              (0x17, 0xc000, "screen1.bin")]
+              (0x17, 0xc000, "screen1.bin"), (0x17, DEPTH_BANK7, "depths.bin"),
+              (0x10, SHARED_LOW, "shared-low.bin")]
     blocks += [(0x10+page, 0xc000, f"page{page}.bin") for page in pages]
     (out/"blocks.inc").write_text("".join(f"    db {latch}\n    dw {addr},{(out/file).stat().st_size}\n"
                                          for latch,addr,file in blocks))
@@ -57,21 +60,25 @@ def build(assembler, out=BUILD):
     # CLEAR 28671 : LOAD "" CODE : RANDOMIZE USR 28672
     line = b'\xfd'+basic_number(0x6fff)+b':\xef""\xaf:\xf9\xc0'+basic_number(0x7000)+b'\r'
     basic = b"\x00\x0a" + pack("<H",len(line)) + line
-    tap = header(0,b"Coast Run",basic,10,len(basic))
-    tap += header(3,b"COAST RUN", (out/"loader.bin").read_bytes(),0x7000,0x8000)
+    title = name.replace("-"," ").title().encode("ascii")
+    tap = header(0,title,basic,10,len(basic))
+    tap += header(3,title.upper(), (out/"loader.bin").read_bytes(),0x7000,0x8000)
     tap += b"".join(tape_block(255,(out/file).read_bytes()) for _,_,file in blocks)
     # SjASMPlus serialises the same bank payloads to its 128K SNA format.
     snapshot = out/"snapshot.asm"
     snapshot.write_text("    device ZXSPECTRUM128\n" + "".join(
         f'    page {latch & 7}\n    org {addr}\n    incbin "{file}"\n' for latch,addr,file in blocks)
-        + '    page 0\n    savesna "coast-run.sna",#8000\n')
+        + f'    page 0\n    savesna "{name}.sna",#8000\n')
     assemble(snapshot)
-    (out/"coast-run.tap").write_bytes(tap)
-    print(f"Built {out/'coast-run.tap'} ({len(tap):,} bytes) and coast-run.sna")
+    (out/f"{name}.tap").write_bytes(tap)
+    print(f"Built {out/f'{name}.tap'} ({len(tap):,} bytes) and {name}.sna")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--assembler", type=Path)
+    parser.add_argument("--course", choices=COURSES)
     args = parser.parse_args()
-    build(executable(args.assembler,"SJASMPLUS","sjasmplus","Desktop/_temp/sjasmplus-1.20.2.win/sjasmplus.exe"))
+    assembler = executable(args.assembler,"SJASMPLUS","sjasmplus","Desktop/_temp/sjasmplus-1.20.2.win/sjasmplus.exe")
+    for course in ([args.course] if args.course else COURSES):
+        build(assembler, BUILD if course == "coast" else BUILD/course, course)

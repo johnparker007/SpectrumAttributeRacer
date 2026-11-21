@@ -1,4 +1,4 @@
-; Coast Run. Code, stack, raster table and pending writes live in fixed bank 2.
+; Spectrum Attribute Racer. Code, stack and raster tables live in fixed bank 2.
     device ZXSPECTRUM128
     include "layout.inc"
     ; SP streams a 14-byte tile job. Both loops use the same fixed-cost stores.
@@ -98,24 +98,30 @@ restoreSP:
     ld sp,0
 blitDone:
     ; Calibrated from IM2 entry. No video RAM or I/O access in this delay.
-    ld bc,564
+    ld bc,352
 .align:
     dec bc : ld a,b : or c : jr nz,.align
-phasePointer:
-    ld hl,phaseTable
+    ld a,0 : nop
+    ld hl,activeDepth
+    ld d,high portColours
     ld bc,#7ffd
-    ld e,DASH-HORIZON
+    ld ixl,DASH-RASTER_TOP
 scanline:
     ld a,(hl)
+phaseAdd:
+    add a,0
+    ld e,a
+    ld a,(de)
     inc hl
 latch:
     out (c),a
-    ld d,11
+    ld a,9
 .delay:
-    dec d : jr nz,.delay
-    ld a,0
-    nop
-    dec e
+    dec a : jr nz,.delay
+    dup 3
+        ld a,0                  ; 21 T horizontal-blank padding
+    edup
+    dec ixl
     jp nz,scanline              ; 228 T from OUT to OUT, including the final line
     ld a,#17
     out (c),a
@@ -224,50 +230,30 @@ advance:
 .travel:
     ld a,(gear) : ld b,a
     ld a,(phase) : add a,b : and 31 : ld (phase),a
-    ; The raster phase is a distance coordinate, wrapped independently of laps.
-    ld e,a : ld d,0
-    ld hl,phaseTable
-    add a,a : add a,a : add a,a   ; 8*p (fits in a byte)
-    ld e,a
-    add hl,de
-    sla e : rl d                 ; 16*p
-    sla e : rl d                 ; 32*p
-    add hl,de
-    sla e : rl d                 ; 64*p
-    add hl,de                    ; 104*p
-    ld (phasePointer+1),hl
+    ld (phaseAdd+1),a
     ld a,(travel) : add a,b
-    cp 24
+    cp TRAVEL_PER_STEP
     jr nc,.next
     ld (travel),a : ret
 .next:
-    sub 24 : ld (travel),a
+    sub TRAVEL_PER_STEP : ld (travel),a
     ld a,(step) : inc a : and 63 : ld (step),a
-    ; A bend nudges the rider to the outside every other track step.
-    bit 0,a : jr nz,.descriptor
-    cp 4 : jr c,.descriptor
-    cp 29 : jr c,.left
-    cp 36 : jr c,.descriptor
-    cp 61 : jr nc,.descriptor
-    call steerRight : jr .descriptor
-.left:
-    call steerLeft
 .descriptor:
-    ld a,(step)
-    ld l,a : ld h,0 : add hl,hl
-    ld e,l : ld d,h : add hl,hl : add hl,de
+    ld l,a : ld h,0 : add hl,hl : add hl,hl : add hl,hl
     ld de,course : add hl,de
     ld a,(hl) : or #10 : ld (dataPage),a : inc hl
     ld a,(hl) : ld (batches),a : inc hl
-    ld b,(hl) : inc hl
+    ld a,(hl) : ld (rivalX),a : inc hl
     ld c,(hl) : inc hl
-    ld e,(hl) : inc hl : ld d,(hl) : ld (cursor),de
-    ld (rivalFoot),bc
-    ret
+    ld e,(hl) : inc hl : ld d,(hl) : inc hl : ld (cursor),de
+    ld e,(hl) : inc hl : ld d,(hl) : ld (depthSource+1),de
+    ld a,c : or a : ret z
+    jp p,steerRight
+    jp steerLeft
 judgePass:
     ; Once per pass, compare centres at the rider's depth.
-    ld bc,(rivalFoot)
-    ld a,c : cp 160 : ret c
+    ld a,(step) : and 31 : cp 31 : ret nz
+    ld a,(rivalX) : ld b,a
     ld a,(bikeCol) : add a,a : add a,a : add a,a : add a,12
     sub b : add a,12 : cp 25
     jr nc,.clear
@@ -283,6 +269,7 @@ prepareTiles:
     ld sp,(cursor)
     ld a,(dataPage)
     ld bc,#7ffd : out (c),a
+    pop hl : ld (depthSlice+1),hl
     ld de,jobs
     ld a,BATCH_TILES
 .tile:
@@ -311,6 +298,15 @@ prepareTiles:
     dec a : jp nz,.bottomTile
 streamSP:
     ld sp,0
+    ; Bank 7 now holds the shadow screen and the pose depth maps. During
+    ; the raster, all tables read by the CPU are in uncontended bank 2.
+depthSource:
+    ld hl,0
+depthSlice:
+    ld bc,0                     ; C = first scanline, B = number to copy
+    ld d,0 : ld e,c : add hl,de
+    ld d,high activeDepth
+    ld c,b : ld b,0 : ldir
     ld a,(batches) : or a : ret nz
     jp judgePass
 
@@ -356,18 +352,28 @@ steerTimer: db 0
 gearTimer:  db 0
 batches:    db 0
 dataPage:   db 0
-rivalFoot:  dw 0
+rivalX:     db 0
 cursor:     dw 0
 underlay:   ds 90
 jobs:
     dup BATCH_TILES
-        dw #6800,#6000,0
+        dw #5800,#4000,0       ; black sky cell while the initial queue is empty
         ds 8
     edup
 course:     include "course.inc"
 riderArt:   incbin "riders.bin"
-phaseTable: incbin "road-phases.bin"
 digits:     incbin "digits.bin"
+    align 256
+activeDepth: incbin "depths.bin",0,DASH-RASTER_TOP
+    align 256
+portColours:
+    dup 64, stripe
+        db #17 + ((stripe & 16) >> 1)
+    edup
+    ds 32,#17                  ; sky sentinel 64 + distance phase
+    assert $ <= SHARED_FAST
+    org SHARED_FAST
+    incbin "shared-fast.bin"
     assert $ < #bd00
     org #bfbf
 irq:
