@@ -422,5 +422,8 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
+# Generated Spectrum tape, snapshots, symbols and capture output
+/build/
+
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
