@@ -1,7 +1,7 @@
 """Exercise the release TAP, keyboard, frame deadlines and ULA output in headless ZEsarUX."""
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from hashlib import sha256
@@ -14,7 +14,7 @@ from build import BUILD, executable
 from course import (ASPHALT, KERB, KERB_ATTRS, MATERIALS, PAINT, PHASES, TRAVEL_PER_STEP,
                     artwork, bitmap_offset, riders, road, scenery, screen, tiles, visible,
                     EARLY_TILES, EXTRA_TILES, FONT, MAP_WIDTH, MARGIN, POSES, SUBSTEPS)
-from kerbs import FIRST_BAND, geometry, overlay_kerbs
+from kerbs import FIRST_BAND, STAMP_CELLS, WIDTHS, geometry, overlay_kerbs
 from route import COURSES, DASH, STEPS, TOP, TYRES, drift, projection
 
 FRAME, LINE = 70908, 228
@@ -97,7 +97,34 @@ def fixture(folder, name, image, symbols, **changes):
     return path
 
 
-def gameplay(emulator,model,s,folder,image,expected):
+def paint_samples(paper, surface, lane):
+    """Count complete paint runs directly in the emulator's BGR pixels."""
+    counts = Counter()
+    for y in range(TOP+64,DASH):
+        section = surface[y-TOP]
+        if section.halfwidth < 24:
+            continue
+        line = paper[y]
+        bright = line[0::3].count(192)<60
+        ink = b"\xff"*3 if bright else b"\0\0\xc0"
+        mask = bytes(line[x:x+3]==ink for x in range(0,len(line),3))
+        centre = section.x-(lane-128)*TYRES/section.z
+        for name,radius,window in (("kerb",section.halfwidth+(section.kerb+1)/2,section.kerb/2+5),
+                                   ("lane",section.halfwidth*.36,5)):
+            if name=="lane" and not bright:
+                continue
+            for side in (-1,1):
+                x = centre+side*radius
+                lo,hi = round(x-window),round(x+window)+1
+                if lo<0 or hi>256 or (y>=143 and lo<140 and hi>108):
+                    continue
+                counts[name] += 1
+                if len(re.findall(b"\x01+",mask[lo:hi]))==1:
+                    counts[name+"_whole"] += 1
+    return counts
+
+
+def gameplay(emulator,model,s,folder,image,expected,course):
     fast = fixture(folder,"lap",image,s,gear=4,lane=140)
     peek = lambda name: f"PEEK({s[name]:04X}H)"
     capture = folder/"lap.raw"
@@ -113,17 +140,24 @@ def gameplay(emulator,model,s,folder,image,expected):
     margin = FRAME-max(waits)
     require(margin>128,f"{model} bottom border overrun, {margin} T")
     seen,matched,active = set(),0,False
+    paint = Counter()
+    lanes = [140]
+    for q in range(1,POSES):
+        lanes.append(max(8,min(248,lanes[-1]+drift(q//SUBSTEPS,course)*(1 if q%2 else 2))))
     for rows in paper_frames(capture,192):
         hit = expected.get(sha256(b"".join(rows)).digest())
         if hit is not None:
             active = True
             seen.add(hit)
+            paint.update(paint_samples(rows,projection(hit/SUBSTEPS,course)[1],lanes[hit]))
             matched += 1
         elif active and len(seen)<POSES:
             raise ValueError(f"{model} unexpected in-motion pixels after {matched} matched frames, poses {len(seen)}")
         if len(seen)==POSES:
             break
     require(len(seen)==POSES,f"{model} real-video lap matched {len(seen)} poses")
+    require(paint["lane_whole"]>.88*paint["lane"] and paint["kerb_whole"]>.97*paint["kerb"],
+            f"{model} interrupted foreground paint across the captured lap: {paint}")
     crash = fixture(folder,"contact",image,s,pose=123,travel=TRAVEL_PER_STEP//SUBSTEPS-4,gear=4,lane=78)
     values = trace(emulator,crash,model,1,s,[("controls",peek("gear")+"+256*"+peek("bump"))])
     require(any(v%256==1 and v//256>0 for _,v in values),f"{model} contact penalty")
@@ -135,7 +169,9 @@ def gameplay(emulator,model,s,folder,image,expected):
     gears={v%256 for k,v in keys if k=="advance"}
     lanes={v//256 for k,v in keys if k=="advance"}
     require(leans=={0,162,324} and len(gears)>=2 and max(lanes)-min(lanes)>4,f"{model} keyboard path")
-    return f"{matched} in-motion frames across all {POSES} poses, two passes, contact, O/P/Q/A, {margin} T headroom"
+    return (f"{matched} in-motion frames across all {POSES} poses, two passes, contact, O/P/Q/A, "
+            f"{margin} T headroom, whole paint runs on {paint['lane_whole']}/{paint['lane']} lane "
+            f"and {paint['kerb_whole']}/{paint['kerb']} kerb samples")
 
 
 @lru_cache(maxsize=8192)
@@ -152,6 +188,24 @@ def verify_joins(course, art):
     ids,_,scales,atlases,stamps = art
     red = [[bytes(((t[1] >> (0 if bits & (128>>x) else 3)) & 7)==2 for x in range(8))
             for bits in t[2:]] for t in atlases[1]]
+    # Test the emitted masks, including the joins between neighbouring tiles
+    # inside a stroke. A correct centre alone cannot detect a pinhole or dot.
+    for band in range(0,len(stamps),STAMP_CELLS):
+        ids_for_stroke = stamps[band:band+STAMP_CELLS]
+        if not any(ids_for_stroke):
+            continue
+        width = WIDTHS[(band//(2*STAMP_CELLS))%len(WIDTHS)]
+        for y in range(8):
+            ink = 7 if width==2 else 2
+            bank = 0 if width==2 else 1
+            bits = bytearray()
+            for tile_id in ids_for_stroke:
+                tile = atlases[1][tile_id]
+                bits.extend(((tile[bank] >> (0 if tile[2+y] & (128>>x) else 3)) & 7)==ink
+                            for x in range(8))
+            runs = re.findall(b"\x01+",bits)
+            require(len(runs)==1 and len(runs[0])==width,
+                    f"{course} split or uneven {width}-pixel paint in stamp {band//STAMP_CELLS}, line {y}")
     joins = steps = absent = 0
     for pose in range(POSES):
         bands = geometry(pose,course)
@@ -372,7 +426,7 @@ def steering(emulator,model,s,folder,image,art,course):
         r = projection(0,course)[1][135-TOP]
         centre = r.x-r.halfwidth-r.kerb/2-(lane-128)*TYRES/r.z
         # Track the middle of the painted left kerb in real video. Lane dashes
-        # and roadside objects use a separate, coarser steering offset.
+        # share its steering endpoints. Roadside objects use the scenery scroll.
         mask = bytes(line[x:x+3] in (b"\xff"*3,b"\0\0\xc0") for x in range(0,len(line),3))
         runs = [(m.start()+m.end()-1)/2 for m in re.finditer(b"\x01{4,}",mask)]
         require(runs,f"{model} missing foreground kerb at lane {lane}")
@@ -446,7 +500,7 @@ def main():
                 def report(result):
                     print(f"{course} {model}: {result}",flush=True)
                 report(raster(emu,model,symbols,image))
-                report(gameplay(emu,model,symbols,folder,image,terrain_frames))
+                report(gameplay(emu,model,symbols,folder,image,terrain_frames,course))
                 report(steering(emu,model,symbols,folder,image,art,course))
                 report(video(emu,model,folder,expected,image.with_suffix(".tap")))
         with ThreadPoolExecutor(max_workers=3) as pool:

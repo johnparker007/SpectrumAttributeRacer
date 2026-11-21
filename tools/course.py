@@ -6,8 +6,8 @@ from math import cos, sin
 from pathlib import Path
 from struct import pack
 
-from kerbs import (FIRST_BAND, MATH_ADDR, SHIFT_ADDR, SLOPES, STAMP_ADDR, WIDTHS, geometry, geometry_data, masks,
-                   math_data, overlay_kerbs, stamp_data)
+from kerbs import (FIRST_BAND, SHIFT_ADDR, SLOPES, STAMP_ADDR, STAMP_CELLS, WIDTHS, PHASES as STROKE_PHASES, camera_shift, geometry, geometry_data, masks,
+                   math_data, overlay_kerbs, stamp_source, stroke_offsets)
 from route import DASH, STEPS, TOP, TYRES, at_distance, drift, profile, projection
 
 WIDTH, HEIGHT = 256, 192
@@ -140,6 +140,10 @@ def road(pic, step, course="coast", margin=0):
         row[:] = bytes([ASPHALT]) * len(row)
         span(row, left-r.kerb, left, KERB)
         span(row, right, right+r.kerb, KERB)
+        # At the horizon the two lane dividers would share ULA cells with
+        # the kerbs. Start the paint where the two lanes are distinguishable.
+        if r.halfwidth < 20:
+            continue
         for side in (-1, 1):
             mark = margin + round(r.x + side*r.halfwidth*.36)
             span(row, max(left+1, mark), min(right-1, mark+1+int(r.z<2.3)), PAINT)
@@ -314,7 +318,7 @@ def course_maps(course):
             for x in range(0,8*MAP_WIDTH,8):
                 cell = b"".join(line[x:x+8] for line in pic[y:y+8])
                 if use_stamp:
-                    cell = cell.replace(bytes([KERB]),bytes([ASPHALT]))
+                    cell = cell.translate(CLEAR_PAINT)
                 base.append(encode(cell))
         maps.append(base)
         rows = projection(step,course)[1]
@@ -328,6 +332,8 @@ def course_maps(course):
 KERB_ATTRS = bytes((0x47, 0x0a))
 ROAD_TILE = encode(bytes([ASPHALT])*64)
 SOLID_KERB = encode(bytes([KERB])*64)
+LANE_ATTRS = encode(bytes([ASPHALT, PAINT])*32)[:2]
+CLEAR_PAINT = bytes.maketrans(bytes([KERB, PAINT]), bytes([ASPHALT, ASPHALT]))
 
 
 def kerb_tile(bits):
@@ -338,21 +344,94 @@ def kerb_tile(bits):
     return KERB_ATTRS+bits
 
 
-def stamp_tiles():
-    return [kerb_tile(bits) for slope in SLOPES for width in WIDTHS for phase in (0,2,4,6)
-            for bits in masks(slope,width,phase)]
+def stroke_usage(course):
+    uses = Counter()
+    for pose in range(POSES):
+        for band in geometry(pose,course):
+            if not band.use_stamp:
+                continue
+            for lane in range(8,249,4):
+                a = camera_shift(lane,band.start.scale)
+                b = camera_shift(lane,band.end.scale)
+                for side,w in ((0,band.width),(1,band.width),(3,2),(4,2)):
+                    start = round(band.start[side]/4)-a
+                    end = round(band.end[side]/4)-b
+                    slope = 4*(end-start)
+                    assert slope in SLOPES
+                    visible = max(start,end)*4+w>0 and min(start,end)*4<WIDTH
+                    weight = 1 + 4*visible + 6*(visible and 56<=lane<=200)
+                    uses[slope,w,4*(min(start,end)%2)] += weight
+    return uses
+
+
+@lru_cache(maxsize=2)
+def stroke_templates(course):
+    uses = stroke_usage(course)
+    selected = {}
+    options = {}
+    counts = Counter()
+    for key in sorted(uses):
+        slope,width,phase = key
+        variants = {}
+        for gx,gy in ((4,4),(2,4),(4,2),(2,2),(1,2),(4,1),(2,1),(1,1)):
+            bits = masks(*key,gx,gy)
+            tiles = tuple((LANE_ATTRS+b if any(b) else ROAD_TILE) if width==2 else kerb_tile(b)
+                          for b in bits)
+            # Penalise unequal steps and errors where two bands join. Every
+            # candidate still has one uninterrupted run of the specified width.
+            shifts = stroke_offsets(slope,gx,gy)
+            exact = stroke_offsets(slope)
+            diff = [a-b for a,b in zip(shifts,exact)]
+            error = sum(e*e for e in diff) + 6*(diff[0]**2+diff[-1]**2)
+            error += 2*sum((a-b)**2 for a,b in zip(diff,diff[1:]))
+            variants[tiles] = error
+        options[key] = [(tiles,err,set(tiles)) for tiles,err in variants.items()]
+        chosen = min(options[key],key=lambda v:v[1]) if width==2 or abs(slope)<=20 else options[key][0]
+        selected[key] = chosen
+        counts.update(chosen[2])
+
+    # Spend the remaining tile IDs improving the most visible stair steps.
+    # Replacing a template releases any masks it alone was using.
+    budget = 224
+    assert len(counts)<=budget
+    while True:
+        best, score = None, 0
+        for key,(_,old_error,old_tiles) in selected.items():
+            for candidate in options[key]:
+                _,error,tiles = candidate
+                if error>=old_error:
+                    continue
+                added = sum(t not in counts for t in tiles-old_tiles)
+                freed = sum(counts[t]==1 for t in old_tiles-tiles)
+                if len(counts)+added-freed>budget:
+                    continue
+                improvement = (error-old_error)*uses[key]**.8 / max(1,added-freed)
+                if improvement>score:
+                    best,score = (key,candidate),improvement
+        if best is None:
+            break
+        key,candidate = best
+        for t in selected[key][2]-candidate[2]:
+            counts[t]-=1
+            if not counts[t]:
+                del counts[t]
+        counts.update(candidate[2]-selected[key][2])
+        selected[key] = candidate
+    empty = (ROAD_TILE,)*STAMP_CELLS
+    return [tile for s in SLOPES for w in WIDTHS for p in STROKE_PHASES
+            for tile in (selected[s,w,p][0] if (s,w,p) in selected else empty)]
 
 
 def tile_features(tile):
     rows = tile[2:]
     bits = int.from_bytes(rows, "little")
-    if tile[:2] != KERB_ATTRS:
+    if tile[:2] not in (KERB_ATTRS, LANE_ATTRS):
         return bits
     # Pack extra copies of boundary pixels and occupied-row flags into the
     # distance metric. This keeps a thin diagonal from losing its tip.
     occupied = sum(bool(row) << y for y,row in enumerate(rows))
     borders = bits & 0xff818181818181ff
-    return bits | (borders << 64) | ((occupied * 0x01010101) << 128)
+    return bits | (borders << 64) | ((occupied * 0x0101010101010101) << 128)
 
 
 def tile_atlas(strips, stamps=()):
@@ -360,20 +439,24 @@ def tile_atlas(strips, stamps=()):
     # bitmaps, then match rarer edge shapes by their eight scanline masks.
     counts = Counter(t for row in strips for t in row)
     if stamps:
-        # Include even the shapes seen only at the limits of steering.
-        counts.update({t:6*n for t,n in Counter(stamps).items()})
+        # Keep every selected stroke tile exact, including at full steering lock.
+        counts.update(stamps)
         counts[ROAD_TILE] += sum(counts.values())
     groups = {}
     for t,_ in counts.most_common():
         groups.setdefault(t[:2],[]).append(t)
     if len(groups)>256:
         raise ValueError("A road half exceeds the 256 tile attribute pairs available")
-    atlas = list(dict.fromkeys([g[0] for g in groups.values()] + [t for t,_ in counts.most_common()]))[:256]
-    # Reserve the existing kerb slots for a range of slopes. Weight the
+    reserved = list(dict.fromkeys([g[0] for g in groups.values()] + list(stamps)))
+    assert len(reserved)<=256
+    atlas = list(dict.fromkeys(reserved + [t for t,_ in counts.most_common()]))[:256]
+    # Fit remaining scenery paint slots to a range of slopes. Weight the
     # remaining error by use count so rare shapes cannot crowd out common ones.
-    slots = [i for i,t in enumerate(atlas) if t[:2]==KERB_ATTRS]
-    if slots:
-        variants = groups[KERB_ATTRS]
+    for paint in (KERB_ATTRS, LANE_ATTRS):
+        slots = [i for i,t in enumerate(atlas) if t[:2]==paint and (not stamps or i>=len(reserved))]
+        if not slots:
+            continue
+        variants = groups[paint]
         features = [tile_features(t) for t in variants]
         weights = [counts[t] for t in variants]
         distances = [256]*len(variants)
@@ -419,7 +502,7 @@ def artwork(course):
     half = len(maps[0])//2
     ids = [bytearray() for _ in maps]
     atlases = []
-    stamps = stamp_tiles()
+    stamps = stroke_templates(course)
     for n in range(2):
         strips = [m[n*half:(n+1)*half] for m in maps]
         atlas,mapping = tile_atlas(strips,stamps if n else ())
@@ -433,8 +516,8 @@ def artwork(course):
     # against the last emitted shape, so successive small movements accumulate.
     for half_index,atlas in enumerate(atlases):
         bits = [tile_features(t) for t in atlas]
-        # Identify whether paint reaches the neighbouring tile above or below.
-        ends = [(bool(t[2]), bool(t[-1])) if t[:2]==KERB_ATTRS else None for t in atlas]
+        # Holding a previous tile must preserve the occupied paint scanlines.
+        coverage = [tuple(map(bool,t[2:])) if t[:2] in (KERB_ATTRS,LANE_ATTRS) else None for t in atlas]
         close = []
         for i,a in enumerate(bits):
             kerb = atlas[i][:2]==KERB_ATTRS
@@ -442,7 +525,7 @@ def artwork(course):
             # stripe where this tile meets the rows immediately above/below.
             tolerance = 16 if kerb else 5
             matches = {j for j,b in enumerate(bits) if atlas[i][:2]==atlas[j][:2]
-                       and ends[i]==ends[j] and (a^b).bit_count()<=tolerance}
+                       and coverage[i]==coverage[j] and (a^b).bit_count()<=tolerance}
             close.append(matches)
         begin = half_index*half
         previous = ids[-1][begin:begin+half]
@@ -472,7 +555,7 @@ def generate(out: Path, course):
     half = len(ids[0])//2
     for n,atlas in enumerate(atlases):
         (out/f"atlas{n}.bin").write_bytes(b"".join(atlas))
-    (out/"stamps.bin").write_bytes(stamp_data(stamp_ids))
+    (out/"stamps.inc").write_text(stamp_source(stamp_ids))
     (out/"edge-math.bin").write_bytes(math_data())
     (out/"geometry.bin").write_bytes(geometry_data(0,course))
     (out/"roadside.bin").write_bytes(roadside(ids[0][half:]))
@@ -507,11 +590,10 @@ def generate(out: Path, course):
         (out/f"page{page}.bin").write_bytes(data)
     (out/"course.inc").write_text("\n".join(descriptor)+"\n")
     (out/"layout.inc").write_text(f"RASTER_TOP equ {TOP}\nDASH equ {DASH}\nMAP_WIDTH equ {MAP_WIDTH}\n"
-                                  f"SLOPE_TABLE equ {MATH_ADDR}\nSHIFT_TABLE equ {SHIFT_ADDR}\n"
-                                  f"GEOMETRY_BYTES equ {len(geometry_data(0,course))}\n"
+                                  f"STROKE_TABLE equ {STAMP_ADDR}\nSHIFT_TABLE equ {SHIFT_ADDR}\n"
                                   f"SUBSTEP_TRAVEL equ {TRAVEL_PER_STEP//SUBSTEPS}\n"
                                   f"EARLY_TILES equ {EARLY_TILES}\nEXTRA_TILES equ {EXTRA_TILES}\n")
     # One fixed-point perspective offset per band, expressed in map columns.
     (out/"scroll.bin").write_bytes(bytes(max(0,min(MAP_WIDTH-32, MARGIN//8+round((lane-128)*z/(15*8))))
                                          for z in range(16) for lane in range(0,256,4)))
-    return PAGES
+    return [p for p,data in zip(PAGES,pages) if data]

@@ -342,11 +342,7 @@ lowerPatch:
     dup 8
         ldi
     edup
-    ld de,edgeGeometry
-    dup GEOMETRY_BYTES
-        ldi
-    edup
-    ld (roadsideSource+1),hl
+    ld (geometrySource+1),hl
     ld a,(bankValue+1) : ld (roadsideBank+1),a
     ld a,#17 : ld bc,#7ffd : out (c),a : ret
 patchPage:
@@ -408,9 +404,10 @@ lastLane:
     cp 128 : ret z
     ld (lastLane+1),a : xor a : ld (extraLimit),a
     ld a,(clearPage+2) : dec a : ld (scanSource+2),a
-    ld (scenePage+1),a : ld (stampPage+1),a
+    ld (scenePage+1),a : ld (strokePage+1),a
     ld b,a : ld a,(activeLower+1) : inc a : ld (clearPage+2),a
     ld a,b : ld (activeLower+1),a
+    call projectPaint
     call drawKerbs
     ld bc,#7ffd
 roadsideBank:
@@ -534,61 +531,84 @@ atlasLo1:
 atlas0:     incbin "atlas0.bin"
 atlas1:     incbin "atlas1.bin"
 ; Project both ends of every foreground band once. Adjacent bands use the
-; same point even on an outward drift. A unit here is two screen pixels.
-roadsideInitial: incbin "roadside.bin"
+; same point even on an outward drift. Each endpoint unit is four screen pixels.
 edgeGeometry: incbin "geometry.bin"
-    assert $-edgeGeometry == GEOMETRY_BYTES
+roadsideInitial: incbin "roadside.bin"
+widthPages: ds 8
 edgeLeft: ds 9
 edgeRight: ds 9
-drawKerbs:
+markLeft: ds 9
+markRight: ds 9
+projectPaint:
+    ld a,(roadsideBank+1) : ld bc,#7ffd : out (c),a
+    ld (projectSP+1),sp
+geometrySource:
+    ld sp,edgeGeometry
     ld a,(lane) : rrca : rrca : and 63 : ld c,a
     dup 9,i
-        ld a,(edgeGeometry+3*i) : rrca : rrca : ld h,a
-        and #c0 : or c : ld l,a
-        ld a,h : and 15 : add a,high SHIFT_TABLE : ld h,a : ld b,(hl)
-        ld hl,(edgeGeometry+3*i+1)
+        pop hl : ld a,l : or c : ld l,a : ld b,(hl)
+        pop hl
         ld a,l : add a,b : ld (edgeLeft+i),a
         ld a,h : add a,b : ld (edgeRight+i),a
+        pop hl
+        ld a,l : add a,b : ld (markLeft+i),a
+        ld a,h : add a,b : ld (markRight+i),a
     edup
+    ld hl,0 : add hl,sp : ld de,widthPages
+    dup 8
+        ldi
+    edup
+    ld (roadsideSource+1),hl
+projectSP:
+    ld sp,0 : ld bc,#7ffd : ld a,#17 : out (c),a : ret
+drawKerbs:
+strokePage:
+    ld d,high (targetMap+256)
     dup 8,row
-        ld a,(edgeGeometry+27+row) : cp 255 : jr z,1f
-        ld (stampWidth+1),a
-        ld a,32*row : ld (stampRow+1),a
+        ld a,(widthPages+row) : cp 255 : jr z,1f
+        ld c,32*row
+        ld a,high STROKE_TABLE : ld (strokeWidth+1),a
+        ld hl,(markLeft+row) : call drawStamp
+        ld hl,(markRight+row) : call drawStamp
+        ld a,(widthPages+row) : ld (strokeWidth+1),a
         ld hl,(edgeLeft+row) : call drawStamp
         ld hl,(edgeRight+row) : call drawStamp
 1:
     edup
     ret
 drawStamp:
-    ld a,h : sub l : jr nc,.origin
-    ld l,h
-.origin:
-    ld e,a : ld d,high SLOPE_TABLE : ld a,(de) : ld h,a
-    ld a,l : ld b,a : and 3 : add a,a : add a,a : add a,a
-stampWidth:
-    or 0 : ld l,a
-    ld a,(hl) : inc l : ld c,a : and 7 : ld e,a
-    ld a,c : rrca : rrca : rrca : and 7 : ld c,a
-    ld a,b : srl a : srl a : add a,c : sub 18
-    jr nc,.right
-    ; Skip the part before x=0, including a wholly off-screen stamp.
-    neg : ld b,a : ld a,e : sub b : ret c : ret z : ld e,a
-    ld a,l : add a,b : ld l,a : xor a
+    ; L/H are the biased start/end in four-pixel units. Retain the start
+    ; column in E and use its low bit to select the horizontal phase.
+    ld a,h : sub l : add a,a : ld h,a
+    srl l : ld e,l : ld a,h : adc a,0 : add a,a : ld l,a
+strokeWidth:
+    ld h,0 : ld a,(hl) : inc l : ld h,(hl) : ld l,a : ld a,e : jp (hl)
+clip1: ld b,1 : jr clipStroke
+clip2: ld b,2 : jr clipStroke
+clip3: ld b,3 : jr clipStroke
+clip4: ld b,4 : jr clipStroke
+clip5: ld b,5 : jr clipStroke
+clip6: ld b,6 : jr clipStroke
+clip7: ld b,7 : jr clipStroke
+clip8: ld b,8 : jr clipStroke
+clip9: ld b,9 : jr clipStroke
+clip10: ld b,10 : jr clipStroke
+clipStroke:
+    ; The saved PC points at OR C / LD E,A, then four bytes per tile. A fully
+    ; off-screen run exits directly to the caller of drawStamp.
+    pop hl : or a : jp p,.right
+    ld e,a : add a,b : ret nc : ret z : ld a,e
+    jr .start
 .right:
-    cp 32 : ret nc : ld c,a : add a,e : cp 33 : jr c,.write
-    ld a,32 : sub c : ld e,a
-.write:
-    ld a,7 : sub e : add a,a : ld (stampCopy+1),a : ld a,c
-stampRow:
-    add a,0 : ld e,a
-stampPage:
-    ld d,high (targetMap+256)
-stampCopy:
-    jr $
-    dup 7
-        ldi
-    edup
-    ret
+    cp 32 : ret nc
+.start:
+    inc hl : inc hl : inc hl : ld e,a
+.loop:
+    ld a,(hl) : or a : jr z,.skip
+    ld a,e : cp 32 : jr nc,.skip
+    or c : ld e,a : ld a,(hl) : ld (de),a : ld a,e : and 31 : ld e,a
+.skip:
+    inc e : inc hl : inc hl : inc hl : inc hl : djnz .loop : ret
     align 256
 spareLower: ds 256
     assert $ < #bd00
@@ -596,3 +616,10 @@ spareLower: ds 256
 irq:
     jp irqReturn
     savebin "core.bin",start,$-start
+
+    page 7
+    org STROKE_TABLE
+strokeData:
+    include "stamps.inc"
+    assert $ <= #10000
+    savebin "stamps.bin",strokeData,$-strokeData
