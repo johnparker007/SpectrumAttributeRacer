@@ -11,8 +11,8 @@ import subprocess
 import tempfile
 
 from build import BUILD, executable
-from course import (ASPHALT, GRASS, KERB, MATERIALS, PAINT, PHASES, TRAVEL_PER_STEP,
-                    artwork, bitmap_offset, edges, riders, road, scenery, screen, tiles, visible,
+from course import (ASPHALT, KERB, KERB_ATTRS, MATERIALS, PAINT, PHASES, TRAVEL_PER_STEP,
+                    artwork, bitmap_offset, riders, road, scenery, screen, tiles, visible,
                     EARLY_TILES, EXTRA_TILES, FONT, MAP_WIDTH, MARGIN, POSES, SUBSTEPS)
 from route import COURSES, DASH, STEPS, TOP, TYRES, drift, projection
 
@@ -145,11 +145,13 @@ def pixels(attr, bits):
     return b"".join(colours[bool(bits & (128>>bit))] for bit in range(8))
 
 
-def verify_terrain(course):
+def verify_terrain(course, art):
+    ids,_,_,atlases = art
+    kerb_rows = missing_rows = 0
     pic = scenery(course)
     crests, centres, depth_jumps = [], [], []
     simple_cells = crowded_cells = hidden_sections = 0
-    terrain = {GRASS, KERB, ASPHALT, PAINT}
+    terrain = {KERB, ASPHALT, PAINT}
     for step in range(STEPS):
         rival_x, rival_y = road(pic, step, course)
         samples, rows = projection(step, course)
@@ -159,11 +161,9 @@ def verify_terrain(course):
         require(rows[-1].z == TYRES and rows[-1].x == 128, f"Road moved under tyres at {step}")
         if step in (31,63):
             require(rival_y == DASH-1 and rival_x == (74 if step==31 else 182), "Pass gate drift")
-        for r, pair in zip(rows,edges(step,course)):
-            if r:
-                left, right = pair
-                require(abs(left+r.kerb-round(r.x-r.halfwidth))<=5 and
-                        abs(right-1-round(r.x+r.halfwidth))<=5, f"Kerb off its line at {step}, {r.y}")
+        require(rows[-1].kerb==18, "Expected an 18-pixel kerb at the tyres")
+        for r in surface:
+            require(r.kerb==round((4.5+39.5/r.z)/2), f"Kerb width at {step}, {r.y}")
         for a,b in zip(surface,surface[1:]):
             require(a.y+1 == b.y and a.z>b.z, f"Folded or missing road line at {step}")
             depth_jumps.append(a.z-b.z)
@@ -177,18 +177,29 @@ def verify_terrain(course):
                 if not materials <= terrain:
                     continue
                 tile = scene[y//8*32+col]
+                require(tile[0]&64, f"Missing BRIGHT on the bright terrain at {step}, {col}, {y}")
                 require(not tile[1]&64, f"Bright dim-band tile at {step}, {col}, {y}")
                 if len(materials)>2:
                     crowded_cells += 1  # A depth break can put a third material in a ULA cell.
                     continue
                 simple_cells += 1
+                if tile[:2]==KERB_ATTRS:
+                    band = (y-TOP)//8
+                    tile_id = ids[step*SUBSTEPS][band*MAP_WIDTH+MARGIN//8+col]
+                    stored = atlases[band//8][tile_id]
+                    for source,row in zip(tile[2:],stored[2:]):
+                        if source:
+                            kerb_rows += 1
+                            missing_rows += row==0
                 for i,m in enumerate(cell):
                     shift = 0 if tile[2+i//8] & (128>>(i%8)) else 3
                     for bank,attr in enumerate(tile[:2]):
                         actual = (attr>>shift)&7
-                        if actual and attr&64:
+                        if attr&64:
                             actual += 8
                         require(actual==MATERIALS[m][bank], f"Edge colour at {step}, {col}, {y}, bank {bank}")
+    require(kerb_rows and missing_rows < kerb_rows*.06,
+            f"Tile compression dropped {missing_rows}/{kerb_rows} occupied kerb rows")
     require(crowded_cells*40 < simple_cells+crowded_cells, "Over 2.5% of terrain cells need three colours")
     require(max(crests)-min(crests)>=18 and max(depth_jumps)>8 and hidden_sections, "Missing hill occlusion")
     require(min(centres)<50 and max(centres)>200, "Insufficient left/right bend range")
@@ -326,11 +337,13 @@ def video(emulator,model,folder,expected,tape):
               ["--vofilefps","50","--frameskip","0","--disable-autoframeskip","--vofile",raw])
     require("352 X 304, bgr24" in log,f"{model} unknown realvideo format")
     seen = set()
-    # BGR24 at normal intensity. Match complete, unobstructed scanlines in
-    # real video, including lane dashes disappearing on the dim screen.
-    green, red, blue = (b"\x00\xc0\x00", b"\x00\x00\xc0", b"\xc0\x00\x00")
-    dim_row = re.compile(b"".join(b"(?:" + colour + b")+" for colour in (green, red, blue, red, green)))
-    dim_lines = set()
+    # Match entire real-video rows. Bright rows may include white lane dashes.
+    red, blue = b"\x00\x00\xc0", b"\xc0\x00\x00"
+    dim_row = re.compile(b"".join(b"(?:" + colour + b")+" for colour in (blue, red, blue, red, blue)))
+    black, white = bytes(3), bytes([255])*3
+    black_run, white_run = b"(?:"+black+b")+", b"(?:"+white+b")+"
+    bright_row = re.compile(black_run+white_run+black_run+b"(?:"+white_run+black_run+b"){1,3}")
+    dim_lines, bright_lines = set(), set()
     previous = None
     for rows in paper_frames(raw,192):
         match = expected.get(sha256(b"".join(rows)).digest())
@@ -339,14 +352,17 @@ def video(emulator,model,folder,expected,tape):
             for y in range(TOP, DASH):
                 if y not in dim_lines and dim_row.fullmatch(rows[y]):
                     dim_lines.add(y)
+                if y not in bright_lines and bright_row.fullmatch(rows[y]):
+                    bright_lines.add(y)
             if previous and previous[0]==match[0]:
                 require(match[1]==(previous[1]+2)%PHASES, f"{model} unexpected stripe motion")
         previous = match
     steps,phases = {s for s,_ in seen},{p for _,p in seen}
     require(len(steps)>=4 and len(phases)>=8, f"{model} release tape pixel matches {sorted(seen)}")
-    require(len(dim_lines) >= 40, f"{model} five-colour-run sequence seen on only {len(dim_lines)} scanlines")
-    return (f"retail tape matched {len(steps)} road poses, {len(phases)} raster phases and the full "
-            f"dim green/red/blue/red/green sequence on {len(dim_lines)} scanlines")
+    require(min(len(dim_lines),len(bright_lines))>=40,
+            f"{model} complete kerb runs on {len(dim_lines)} dim and {len(bright_lines)} bright scanlines")
+    return (f"retail tape matched {len(steps)} road poses, {len(phases)} raster phases and both kerbs on "
+            f"{len(dim_lines)} blue/red and {len(bright_lines)} black/white scanlines")
 
 
 def main():
@@ -362,8 +378,8 @@ def main():
         symbols = {k:int(v,16) for k,v in re.findall(r"^(\S+): EQU 0x([0-9A-Fa-f]+)$",
                                                       (out/"racer.sym").read_text(), re.M)}
         symbols["afterLatch"] = symbols["latch"]+2
-        print(f"{course}: {verify_terrain(course)}",flush=True)
         art = artwork(course)
+        print(f"{course}: {verify_terrain(course,art)}",flush=True)
         expected = reference(course,art,2,128,128)
         terrain_frames = {key:pose for key,(pose,_) in reference(
             course,art,4,140,POSES*TRAVEL_PER_STEP//SUBSTEPS//4+4).items()}

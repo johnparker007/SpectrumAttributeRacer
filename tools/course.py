@@ -20,11 +20,11 @@ PAGES = (0, 1, 3, 4, 6, 7)
 PAGE_START = {p:(0xdc00 if p==7 else 0xc000) for p in PAGES}
 
 # Each material specifies its colour on the two screen banks. Bit 3 is BRIGHT.
-VOID, GRASS, TEAL, KERB, PAINT, STEEL, LAMP, RUBY, ASPHALT = range(9)
+VOID, TEAL, KERB, PAINT, STEEL, LAMP, RUBY, ASPHALT = range(8)
 # Bank 7 uses normal intensity across the entire road, including the objects.
 # Its lane paint matches the asphalt so the dashes disappear into the blue.
-MATERIALS = [(0, 0), (12, 4), (13, 5), (15, 2), (15, 1), (7, 7),
-             (14, 6), (10, 2), (0, 1)]
+MATERIALS = [(0, 0), (13, 5), (15, 2), (15, 1), (7, 7),
+             (14, 6), (10, 2), (8, 1)]
 STATIC = len(MATERIALS)
 MATERIALS += [(i, i) for i in range(16)]
 
@@ -119,57 +119,28 @@ def background(course):
     return tuple(bytes(row) for row in scenery(course)[:DASH])
 
 
-@lru_cache(maxsize=None)
-def edges(step, course):
-    """Separate the kerb edges within each ULA band, independently across a crest."""
-    rows = projection(step, course)[1]
-    result = [None] * len(rows)
-    for band in range(0, len(rows), 8):
-        start = band
-        while start < band+8:
-            if rows[start] is None:
-                start += 1
-                continue
-            end = start+1
-            while end < band+8 and rows[end] and rows[end-1].z - rows[end].z < 3:
-                end += 1
-            sides = []
-            for side in (-1, 1):
-                spans = []
-                for r in rows[start:end]:
-                    inner = round(r.x + side*r.halfwidth)
-                    lo = inner - r.kerb if side < 0 else inner + 1
-                    spans.append((lo, lo+r.kerb))
-                seam = 8 * round((max(lo for lo, _ in spans) + min(hi for _, hi in spans))/16)
-                # Keep tight downhill bends on their projected path even when
-                # the kerb crosses several character columns in eight lines.
-                offsets = [max(seam-hi, min(0, seam-lo)) for lo,hi in spans]
-                sides.append([lo + max(-5, min(5, offset)) for (lo,_),offset in zip(spans,offsets)])
-            result[start:end] = list(zip(*sides))
-            start = end
-    return result
-
-
 def visible(rows, y, z):
     return TOP <= y < DASH and (rows[y-TOP] is None or rows[y-TOP].z >= z-.04)
 
 
 def road(pic, step, course="coast", margin=0):
     samples, rows = projection(step, course)
-    for i, (r, pair) in enumerate(zip(rows, edges(step, course))):
+    for i, r in enumerate(rows):
         row = pic[TOP+i]
         if r is None:
             sky = background(course)[TOP+i]
             row[:] = sky[:1]*margin + sky + sky[-1:]*margin
             continue
-        lo, hi = (x+margin for x in pair)
-        row[:] = bytes([GRASS]) * len(row)
-        span(row, lo, lo+r.kerb, KERB)
-        span(row, lo+r.kerb, hi, ASPHALT)
-        span(row, hi, hi+r.kerb, KERB)
+        # Both sides of a kerb use the same paper. Its two edges can follow
+        # the projection independently on every scanline.
+        left = margin + round(r.x-r.halfwidth)
+        right = margin + round(r.x+r.halfwidth) + 1
+        row[:] = bytes([ASPHALT]) * len(row)
+        span(row, left-r.kerb, left, KERB)
+        span(row, right, right+r.kerb, KERB)
         for side in (-1, 1):
             mark = margin + round(r.x + side*r.halfwidth*.36)
-            span(row, max(lo+r.kerb+1, mark), min(hi-1, mark+1+int(r.z<2.3)), PAINT)
+            span(row, max(left+1, mark), min(right-1, mark+1+int(r.z<2.3)), PAINT)
 
     # World-space objects use the same depth and elevation as their road.
     # Test each object scanline so a nearer crest can hide its lower half.
@@ -226,7 +197,7 @@ def road(pic, step, course="coast", margin=0):
                         whorl = max((tip-t for base,tip in ((.12,.72),(.38,.86),(.61,1))
                                      if t >= base), default=0)
                         w = max(1, round(19*whorl/z))
-                        span(pic[y], x-w, x+w+1, STATIC+1 if whorl else VOID)
+                        span(pic[y], x-w, x+w+1, STATIC+4 if whorl else VOID)
                 continue
             h, w = max(2,round(26/z)), max(1,round(3/z))
             for dy in range(h):
@@ -253,7 +224,7 @@ def encode(cell):
     # Both banks share a bitmap. Pick two materials for this cell, allowing the
     # bitmap edge to cross an attribute boundary at single-pixel precision.
     count = Counter(cell)
-    if KERB in count and ASPHALT in count and len(count) > 2 and GRASS not in count:
+    if KERB in count and ASPHALT in count and len(count) > 2 and max(count) < STATIC:
         # A distant rider can occupy the same cell as the inner edge. Draw
         # its highlights in the kerb ink so both silhouettes survive the swap.
         cell = bytes(ASPHALT if m in (ASPHALT, PAINT) else KERB for m in cell)
@@ -269,7 +240,7 @@ def encode(cell):
     for page in range(2):
         p, i = MATERIALS[paper][page], MATERIALS[ink][page]
         attrs.append(((p & 7) << 3) | (i & 7) | (64 if max(p,i) >= 8 else 0))
-    # In a mixed edge cell, keep small painted details and clip excess verge.
+    # Encode the selected ink over the shared paper.
     bits = bytes(sum(128 >> x for x in range(8) if cell[8*y+x] == ink)
                  for y in range(8)) if paper != ink else bytes(8)
     return bytes(attrs) + bits
@@ -341,6 +312,23 @@ def course_maps(course):
     return maps,depths,scales
 
 
+# White on bright black / red on normal blue. A bitmap bit marks the
+# same kerb pixel on both screens.
+KERB_ATTRS = bytes((0x47, 0x0a))
+
+
+def tile_features(tile):
+    rows = tile[2:]
+    bits = int.from_bytes(rows, "little")
+    if tile[:2] != KERB_ATTRS:
+        return bits
+    # Pack extra copies of boundary pixels and occupied-row flags into the
+    # distance metric. This keeps a thin diagonal from losing its tip.
+    occupied = sum(bool(row) << y for y,row in enumerate(rows))
+    borders = bits & 0xff818181818181ff
+    return bits | (borders << 64) | ((occupied * 0x01010101) << 128)
+
+
 def tile_atlas(strips):
     # Keep both attributes exact. Spend the remaining tile IDs on common
     # bitmaps, then match rarer edge shapes by their eight scanline masks.
@@ -351,11 +339,25 @@ def tile_atlas(strips):
     if len(groups)>256:
         raise ValueError("A road half exceeds the 256 tile attribute pairs available")
     atlas = list(dict.fromkeys([g[0] for g in groups.values()] + [t for t,_ in counts.most_common()]))[:256]
-    candidates = {pair:[(i,int.from_bytes(t[2:],"little")) for i,t in enumerate(atlas) if t[:2]==pair]
+    # Reserve the existing kerb slots for a range of slopes. Weight the
+    # remaining error by use count so rare shapes cannot crowd out common ones.
+    slots = [i for i,t in enumerate(atlas) if t[:2]==KERB_ATTRS]
+    if slots:
+        variants = groups[KERB_ATTRS]
+        features = [tile_features(t) for t in variants]
+        weights = [counts[t] for t in variants]
+        distances = [256]*len(variants)
+        chosen = 0
+        for slot in slots:
+            atlas[slot] = variants[chosen]
+            centre = features[chosen]
+            distances = [min(d,(v^centre).bit_count()) for v,d in zip(features,distances)]
+            chosen = max(range(len(variants)),key=lambda i: weights[i]*distances[i]**2)
+    candidates = {pair:[(i,tile_features(t)) for i,t in enumerate(atlas) if t[:2]==pair]
                   for pair in groups}
     mapping = {t:i for i,t in enumerate(atlas)}
     for t in counts.keys()-mapping.keys():
-        bits = int.from_bytes(t[2:],"little")
+        bits = tile_features(t)
         mapping[t] = min(candidates[t[:2]],key=lambda c:(c[1]^bits).bit_count())[0]
     return atlas, mapping
 
@@ -396,9 +398,18 @@ def artwork(course):
     # Hold sub-pixel edge noise until it visibly changes the tile. Compare
     # against the last emitted shape, so successive small movements accumulate.
     for half_index,atlas in enumerate(atlases):
-        bits = [int.from_bytes(t[2:],"little") for t in atlas]
-        close = [{j for j,b in enumerate(bits) if atlas[i][:2]==atlas[j][:2] and
-                  (a^b).bit_count()<=5} for i,a in enumerate(bits)]
+        bits = [tile_features(t) for t in atlas]
+        # Identify whether paint reaches the neighbouring tile above or below.
+        ends = [(bool(t[2]), bool(t[-1])) if t[:2]==KERB_ATTRS else None for t in atlas]
+        close = []
+        for i,a in enumerate(bits):
+            kerb = atlas[i][:2]==KERB_ATTRS
+            # Hold small shape changes, but preserve the presence of the
+            # stripe where this tile meets the rows immediately above/below.
+            tolerance = 16 if kerb else 5
+            matches = {j for j,b in enumerate(bits) if atlas[i][:2]==atlas[j][:2]
+                       and ends[i]==ends[j] and (a^b).bit_count()<=tolerance}
+            close.append(matches)
         begin = half_index*half
         previous = ids[-1][begin:begin+half]
         original = [m[begin:begin+half] for m in ids]

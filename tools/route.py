@@ -62,7 +62,7 @@ class Section:
 
     @property
     def kerb(self):
-        return round(4.5 + 39.5 / self.z)
+        return round(2.25 + 19.75 / self.z)
 
 
 @lru_cache(maxsize=None)
