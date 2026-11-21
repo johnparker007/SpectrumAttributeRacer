@@ -10,7 +10,9 @@ import subprocess
 import tempfile
 
 from build import BUILD, executable
-from course import DASH, HORIZON, PHASES, bitmap_offset, riders, road, scenery, screen, tiles
+from course import (DASH, GRASS, HORIZON, KERB, MATERIALS, PAINT, PHASES, STEPS, VOID,
+                    bitmap_offset, centre, halfwidth, riders, road, scenery, screen,
+                    shoulder_width, tiles)
 
 FRAME, LINE = 70908, 228
 WIDTH, HEIGHT = 352, 304
@@ -130,6 +132,49 @@ def pixels(attr, bits):
     return b"".join(colours[bool(bits & (128>>bit))] for bit in range(8))
 
 
+def verify_road_edges():
+    pic = scenery()
+    transitions = 0
+    for step in range(STEPS):
+        road(pic, step)
+        scene = tiles(pic)
+        # Foreground objects can legitimately take a colour away from the
+        # paint in a distant 8x8 cell. The grass/shoulder boundary must be
+        # correct even in a pose that draws a sign nearby.
+        objects = {(y//8, x//8) for y in range(HORIZON, DASH)
+                   for x, material in enumerate(pic[y]) if material not in (VOID, GRASS, KERB, PAINT)}
+        for y in range(HORIZON, DASH):
+            d = y - HORIZON
+            mid, w = centre(step, d), halfwidth(d)
+            kerb = 2 * (1 + d//18)
+            shoulder = shoulder_width(d)
+            for inner, direction in ((round(mid-w), -1), (round(mid+w), 1)):
+                grass_x = inner + direction*(kerb + shoulder + 1)
+                if 0 <= grass_x < 256 and 0 <= grass_x-direction < 256:
+                    transitions += 1
+                for offset in range(kerb + shoulder + 2):
+                    x = inner + direction*offset
+                    if not 0 <= x < 256:
+                        continue
+                    cell = (y//8, x//8)
+                    if cell in objects and offset < kerb + shoulder:
+                        continue
+                    expected = VOID
+                    if 0 < offset <= kerb:
+                        expected = KERB
+                    elif offset == kerb + shoulder + 1:
+                        expected = GRASS
+                    tile = scene[cell[0]*32 + cell[1]]
+                    shift = 0 if tile[2+y%8] & (128 >> (x%8)) else 3
+                    for bank, attr in enumerate(tile[:2]):
+                        colour = (attr >> shift) & 7
+                        if colour and attr & 64:
+                            colour += 8
+                        require(colour == MATERIALS[expected][bank],
+                                f"Road edge mismatch at step {step}, ({x}, {y}), bank {bank}")
+    return f"{transitions} visible grass boundaries and doubled kerbs checked across {STEPS} poses on both screens"
+
+
 def initial_hud_and_rider(scr, step):
     # Idle keyboard, second gear. In the first nine poses the right-hand bend
     # displaces the rider a cell on steps 4, 6 and 8.
@@ -201,6 +246,7 @@ def main():
     symbols = {k:int(v,16) for k,v in re.findall(r"^(\S+): EQU 0x([0-9A-Fa-f]+)$",
                                                   (BUILD/"racer.sym").read_text(),re.M)}
     symbols["afterLatch"] = symbols["latch"]+2
+    print(verify_road_edges(), flush=True)
     expected = reference()
     def check(model):
         with tempfile.TemporaryDirectory(prefix="coast-"+model+"-") as scratch:

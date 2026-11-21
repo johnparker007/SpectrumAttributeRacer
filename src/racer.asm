@@ -1,6 +1,24 @@
 ; Coast Run. Code, stack, raster table and pending writes live in fixed bank 2.
     device ZXSPECTRUM128
     include "layout.inc"
+    ; SP streams a 14-byte tile job. Both loops use the same fixed-cost stores.
+    macro BLIT_TILE
+        pop hl                      ; normal attribute address
+        pop de                      ; matching bitmap address
+        pop bc                      ; the two palettes
+        ld (hl),c
+        set 7,h
+        ld (hl),b
+        ex de,hl
+        ld e,l
+        ld d,h
+        set 7,d
+        dup 4
+            pop bc
+            ld a,c : ld (hl),a : ld (de),a : inc h : inc d
+            ld a,b : ld (hl),a : ld (de),a : inc h : inc d
+        edup
+    endm
     org #8000
 start:
     di
@@ -27,24 +45,10 @@ frameWait:
     ; They finish before the first active display fetch (including on +2A).
     ld (restoreSP+1),sp
     ld sp,jobs
-    ld a,JOBS
+    ld a,TOP_TILES
 tileLoop:
     ex af,af'
-    pop hl                      ; normal attribute address
-    pop de                      ; matching bitmap address
-    pop bc                      ; the two palettes
-    ld (hl),c
-    set 7,h
-    ld (hl),b
-    ex de,hl
-    ld e,l
-    ld d,h
-    set 7,d
-    dup 4
-        pop bc
-        ld a,c : ld (hl),a : ld (de),a : inc h : inc d
-        ld a,b : ld (hl),a : ld (de),a : inc h : inc d
-    edup
+    BLIT_TILE
     ex af,af'
     dec a
     jp nz,tileLoop
@@ -258,7 +262,7 @@ prepareTiles:
     ld a,(dataPage)
     ld bc,#7ffd : out (c),a
     ld de,jobs
-    ld a,JOBS
+    ld a,BATCH_TILES
 .tile:
     ex af,af'
     pop hl                      ; attribute low byte is also bitmap low byte
@@ -273,9 +277,18 @@ prepareTiles:
     ex af,af'
     dec a : jp nz,.tile
     ld (cursor),sp
+    ld bc,#7ffd : ld a,#17 : out (c),a
+    ; The beam has passed the road and the previous rider is restored. Apply
+    ; the last five jobs here, then the first 24 before the next active display.
+    ld sp,jobs+TOP_TILES*14
+    ld a,BOTTOM_TILES
+.bottomTile:
+    ex af,af'
+    BLIT_TILE
+    ex af,af'
+    dec a : jp nz,.bottomTile
 streamSP:
     ld sp,0
-    ld bc,#7ffd : ld a,#17 : out (c),a
     ld a,(batches) : or a : ret nz
     jp judgePass
 
@@ -325,7 +338,7 @@ rivalFoot:  dw 0
 cursor:     dw 0
 underlay:   ds 90
 jobs:
-    dup JOBS
+    dup BATCH_TILES
         dw #6800,#6000,0
         ds 8
     edup

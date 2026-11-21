@@ -9,7 +9,9 @@ from struct import pack
 
 WIDTH, HEIGHT = 256, 192
 HORIZON, DASH = 64, 168
-STEPS, PHASES, JOBS = 64, 32, 24
+STEPS, PHASES = 64, 32
+TOP_TILES, BOTTOM_TILES = 24, 5
+BATCH_TILES = TOP_TILES + BOTTOM_TILES
 PAGES = (0, 1, 3, 4, 6)
 
 # Each material specifies its colour on the two screen banks. Bit 3 is BRIGHT.
@@ -103,6 +105,16 @@ def centre(step, d):
     return 128 + round(60 * bend * (1 - d / (DASH-HORIZON))**2)
 
 
+def kerb_width(d):
+    return 2 * (1 + d//18)
+
+
+def shoulder_width(d):
+    # At the steepest bend an edge travels about 15 pixels over eight lines.
+    # Leave another cell width so grass and kerb can each pair with black.
+    return 22 + d//16
+
+
 def road(pic, step):
     for y in range(HORIZON, DASH):
         d = y - HORIZON
@@ -110,10 +122,8 @@ def road(pic, step):
         row[:] = bytes([GRASS]) * WIDTH
         mid, w = centre(step, d), halfwidth(d)
         left, right = round(mid-w), round(mid+w)
-        kerb = 1 + d//18
-        # An unpainted shoulder leaves room for the ULA cell containing each
-        # kerb to use its second colour for paint, even on a diagonal.
-        apron = 5 + d//12
+        kerb = kerb_width(d)
+        apron = shoulder_width(d)
         span(row, left-kerb-apron, right+kerb+apron+1, VOID)
         span(row, left-kerb, left, KERB)
         span(row, right+1, right+kerb+1, KERB)
@@ -127,7 +137,9 @@ def road(pic, step):
         if d >= DASH-HORIZON:
             continue
         for sign in (-1, 1):
-            x = round(centre(step,d) + sign*(halfwidth(d)*1.16+4))
+            verge = halfwidth(d) + kerb_width(d) + shoulder_width(d)
+            # Keep the post and its whole sign clear of the grass/black cells.
+            x = round(centre(step,d) + sign*(verge + 24 + d//8))
             h, w = max(2, d//5), max(1, d//28)
             for dy in range(h):
                 span(pic[HORIZON+d-dy], x-w, x+w, RUBY if dy >= h*0.65 else STEEL)
@@ -172,6 +184,10 @@ def encode(cell):
     weights = {KERB: 4, PAINT: 4, STEEL: 5, LAMP: 6, RUBY: 6, TEAL: 5}
     ranked = sorted(count, key=lambda m: count[m]*weights.get(m, 1), reverse=True)
     paper, ink = ranked[0], ranked[min(1,len(ranked)-1)]
+    # At the vanishing point a lane dash can share a kerb cell. Preserve the
+    # painted silhouette there; traffic still uses the usual sprite priorities.
+    if count.keys() == {VOID, KERB, PAINT}:
+        paper, ink = VOID, KERB
     # The rider keeps background set bits under the transparent part of its
     # mask. Keep the black asphalt clear even in a mostly painted edge cell.
     if ink == VOID:
@@ -213,7 +229,7 @@ def pack_page(steps):
         for n, tile in delta:
             data += pack("<HH", 0x5800+n, 0xc000+tileset[tile])
         # Fixed-size batches let the pre-display blitter run in constant time.
-        data += data[-4:] * (-len(delta) % JOBS)
+        data += data[-4:] * (-len(delta) % BATCH_TILES)
     return data, offsets
 
 
@@ -259,10 +275,13 @@ def generate(out: Path):
     for bank in range(2):
         (out/f"screen{bank}.bin").write_bytes(screen(states[0], bank))
     groups = [[]]
-    descriptors = []
-    for i, state in enumerate(states):
+    descriptors = [None] * STEPS
+    # Entering and leaving a bend reuse many of the same edge bitmaps. Keep
+    # those poses in one bank; the descriptor table remains in driving order.
+    for i in sorted(range(STEPS), key=lambda step: centre(step, 0)):
+        state = states[i]
         delta = [(n,tile) for n,tile in enumerate(state) if tile != states[i-1][n]]
-        if not 0 < len(delta) <= JOBS*6:
+        if not 0 < len(delta) <= BATCH_TILES*6:
             raise ValueError(f"Step {i}: {len(delta)} dirty tiles exceed the top-gear update window")
         if len(pack_page(groups[-1]+[(i,delta)])[0]) > 16384:
             groups.append([])
@@ -274,12 +293,14 @@ def generate(out: Path):
         (out/f"page{page}.bin").write_bytes(data)
         for (i,delta), offset in zip(steps, offsets):
             x, foot = encounters[i]
-            descriptors.append(f"    db {page}, {(len(delta)+JOBS-1)//JOBS}, {x}, {min(foot,255)}\n"
-                               f"    dw {0xc000+offset}")
+            batches = (len(delta)+BATCH_TILES-1)//BATCH_TILES
+            descriptors[i] = f"    db {page}, {batches}, {x}, {min(foot,255)}\n    dw {0xc000+offset}"
     (out/"course.inc").write_text("\n".join(descriptors)+"\n")
     (out/"riders.bin").write_bytes(riders())
     (out/"road-phases.bin").write_bytes(bytes(
         0x1f if (int(4000/(y-HORIZON+5)) + phase) % PHASES >= PHASES//2 else 0x17
         for phase in range(PHASES) for y in range(HORIZON,DASH)))
-    (out/"layout.inc").write_text(f"HORIZON equ {HORIZON}\nDASH equ {DASH}\nJOBS equ {JOBS}\n")
+    (out/"layout.inc").write_text(f"HORIZON equ {HORIZON}\nDASH equ {DASH}\n"
+                                  f"TOP_TILES equ {TOP_TILES}\nBOTTOM_TILES equ {BOTTOM_TILES}\n"
+                                  "BATCH_TILES equ TOP_TILES + BOTTOM_TILES\n")
     return PAGES[:len(groups)]
