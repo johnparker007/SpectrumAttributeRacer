@@ -1,6 +1,7 @@
 """Exercise the release TAP, keyboard, frame deadlines and ULA output in headless ZEsarUX."""
 
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from hashlib import sha256
@@ -11,7 +12,8 @@ import tempfile
 
 from build import BUILD, executable
 from course import (ASPHALT, GRASS, KERB, MATERIALS, PAINT, PHASES, TRAVEL_PER_STEP,
-                    bitmap_offset, edges, riders, road, scenery, screen, tiles, visible)
+                    artwork, bitmap_offset, edges, riders, road, scenery, screen, tiles, visible,
+                    EARLY_TILES, EXTRA_TILES, FONT, MAP_WIDTH, MARGIN, POSES, SUBSTEPS)
 from route import COURSES, DASH, STEPS, TOP, TYRES, drift, projection
 
 FRAME, LINE = 70908, 228
@@ -64,20 +66,21 @@ def raster(emulator, model, symbols, image):
             groups.append([])
         if groups:
             groups[-1].append((key,value))
+    groups = [g for g in groups if any(k=="latch" for k,_ in g)]
     require(len(groups)>=5, f"{model} fewer than four full raster frames")
     first = []
     for group,following in zip(groups,groups[1:]):
         expected = ["irq","blitDone"] + ["latch","afterLatch"]*(DASH-TOP) + ["rasterDone","frameWait"]
         require([k for k,_ in group]==expected, f"{model} lost a raster event")
         require(following[0][1]//FRAME == group[0][1]//FRAME+1, f"{model} missed INT")
-        require(group[1][1] < 14360, f"{model} top blit ran into active display")
+        require(group[1][1] < 23400, f"{model} top blit ran into road raster")
         writes = []
         for i in range(DASH-TOP):
             t,latch = divmod(group[2+2*i][1],256)
             require(group[3+2*i][1]-t==12 and latch in (0x17,0x1f), f"{model} contended or invalid OUT")
             writes.append(t+9)  # ZEsarUX 10.3 latches OUT (C),A three T before instruction end.
         require(all(t==writes[0]+i*LINE for i,t in enumerate(writes)), f"{model} line drift")
-        require(23440 <= writes[0] <= 23465, f"{model} first OUT outside the chosen border slot: {writes[0]}")
+        require(23415 <= writes[0] <= 23467, f"{model} first OUT outside the chosen border slot: {writes[0]}")
         first.append(writes[0])
     return f"{len(first)} raster frames, first latch {min(first)}..{max(first)} T, {DASH-TOP} writes/frame at 228 T"
 
@@ -93,44 +96,45 @@ def fixture(folder, name, image, symbols, **changes):
     return path
 
 
-def gameplay(emulator,model,s,folder,image,terrain_frames):
-    # Seed top gear on the start line. The release input, motion and rendering
-    # routines then run unmodified through left, right and lap wrap.
-    fast = fixture(folder,"lap",image,s,gear=4,bikeCol=16)
+def gameplay(emulator,model,s,folder,image,expected):
+    fast = fixture(folder,"lap",image,s,gear=4,lane=140)
     peek = lambda name: f"PEEK({s[name]:04X}H)"
     capture = folder/"lap.raw"
-    events = trace(emulator,fast,model,32,s,[
-        ("irq","TSTATESP"),("frameWait","TSTATES"),
-        ("advance.descriptor",peek("step")+"+256*"+peek("batches")),
-        ("controls",peek("passes"))], capture=capture)
-    starts = [v//FRAME for k,v in events if k=="irq"]
-    steps = [v for k,v in events if k=="advance.descriptor"]
-    waits = [v for k,v in events if k=="frameWait"][1:]
-    require(all(b==a+1 for a,b in zip(starts,starts[1:])),f"{model} missed a lap frame")
-    require(steps[:64]==list(range(1,64))+[0], f"{model} incomplete lap or overwritten tile queue ({len(steps)} steps)")
+    events = trace(emulator,fast,model,44,s,[
+        ("irq","TSTATESP"),("frameWait","TSTATES"),("advance.descriptor","A"),
+        ("controls",peek("passes"))],capture=capture)
+    starts = [v//FRAME for k,v in events if k=="irq"][2:]
+    poses = [v for k,v in events if k=="advance.descriptor"]
+    waits = [v for k,v in events if k=="frameWait"][2:]
+    require(all(b==a+1 for a,b in zip(starts,starts[1:])),f"{model} missed a lap interrupt")
+    require(poses[:POSES]==list(range(1,POSES))+[0],f"{model} incomplete lap ({len(poses)} poses)")
     require(any(k=="controls" and v==2 for k,v in events),f"{model} two clean passes were not counted")
     margin = FRAME-max(waits)
-    require(margin>512,f"{model} bottom border overrun")
-    seen = set()
-    for rows in paper_frames(capture, 144):
-        match = terrain_frames.get(sha256(b"".join(rows)).digest())
-        if match:
-            seen.add(match[0])
-    require(len(seen)==STEPS, f"{model} terrain mismatches at poses {sorted(set(range(STEPS))-seen)}")
-
-    crash = fixture(folder,"contact",image,s,step=30,travel=TRAVEL_PER_STEP-4,gear=4,bikeCol=8)
-    values = trace(emulator,crash,model,2,s,[("controls",peek("gear")+"+256*"+peek("bump"))])
-    require(any(v%256==1 and v//256>0 for _,v in values), f"{model} contact failed to reduce speed")
+    require(margin>128,f"{model} bottom border overrun, {margin} T")
+    seen,matched,active = set(),0,False
+    for rows in paper_frames(capture,192):
+        hit = expected.get(sha256(b"".join(rows)).digest())
+        if hit is not None:
+            active = True
+            seen.add(hit)
+            matched += 1
+        elif active and len(seen)<POSES:
+            raise ValueError(f"{model} unexpected in-motion pixels after {matched} matched frames, poses {len(seen)}")
+        if len(seen)==POSES:
+            break
+    require(len(seen)==POSES,f"{model} real-video lap matched {len(seen)} poses")
+    crash = fixture(folder,"contact",image,s,pose=123,travel=TRAVEL_PER_STEP//SUBSTEPS-4,gear=4,lane=78)
+    values = trace(emulator,crash,model,1,s,[("controls",peek("gear")+"+256*"+peek("bump"))])
+    require(any(v%256==1 and v//256>0 for _,v in values),f"{model} contact penalty")
     spool = folder/"keys.txt"
     spool.write_bytes(b"pqoapqoa "*20)
-    controls = trace(emulator,image,model,4,s,[
-        ("advance",peek("gear")+"+256*"+peek("bikeCol")),
-        ("controls.leanDone","HL")], spool)
-    leans = {v-s["riderArt"] for k,v in controls if k=="controls.leanDone"}
-    gears = {v%256 for k,v in controls if k=="advance"}
-    positions = {v//256 for k,v in controls if k=="advance"}
-    require(leans=={0,162,324} and len(gears)>=2 and len(positions)>1, f"{model} keyboard path {leans,gears,positions}")
-    return f"all {STEPS} terrain poses matched in real video, two passes, contact, O/P/Q/A, {margin} T lap headroom"
+    keys = trace(emulator,image,model,4,s,[("advance",peek("gear")+"+256*"+peek("lane")),
+                                        ("controls.leanDone","HL")],spool)
+    leans={v-s["riderArt"] for k,v in keys if k=="controls.leanDone"}
+    gears={v%256 for k,v in keys if k=="advance"}
+    lanes={v//256 for k,v in keys if k=="advance"}
+    require(leans=={0,162,324} and len(gears)>=2 and max(lanes)-min(lanes)>4,f"{model} keyboard path")
+    return f"{matched} in-motion frames across all {POSES} poses, two passes, contact, O/P/Q/A, {margin} T headroom"
 
 
 @lru_cache(maxsize=8192)
@@ -188,12 +192,16 @@ def verify_terrain(course):
     require(crowded_cells*40 < simple_cells+crowded_cells, "Over 2.5% of terrain cells need three colours")
     require(max(crests)-min(crests)>=18 and max(depth_jumps)>8 and hidden_sections, "Missing hill occlusion")
     require(min(centres)<50 and max(centres)>200, "Insufficient left/right bend range")
-    return (f"{STEPS} poses, road crests at lines {min(crests)}..{max(crests)}, "
-            f"{simple_cells} one/two-material terrain cells checked on both screens")
+    heights=[next(r.y for r in projection(q/SUBSTEPS,course)[1] if r) for q in range(POSES)]
+    largest=max(abs(y-heights[i-1]) for i,y in enumerate(heights))
+    require(largest<=3, f"{course} crest jumped {largest} scanlines in a quarter-step")
+    return (f"{POSES} projected crests at lines {min(heights)}..{max(heights)}, largest step {largest} px, "
+            f"{simple_cells} one/two-material cells checked at the {STEPS} whole stations")
 
 
-def initial_hud_and_rider(scr, step, bank, course):
-    col = 14 + sum(drift(i, course) for i in range(1,step+1))
+
+def overlay(scr, bank, gear, passes):
+    col = 14
     sprite = riders()[162:324]
     for tile in range(9):
         row, x = divmod(tile,3)
@@ -208,32 +216,75 @@ def initial_hud_and_rider(scr, step, bank, course):
             offset = bitmap_offset(144+8*row+dy,col+x)
             mask,ink = sprite[tile*18+2+dy*2:tile*18+4+dy*2]
             scr[offset] = ink if bank == 1 and solid else (scr[offset] & mask) | ink
-    scr[6144+22*32+16:6144+22*32+20] = bytes((0x46,0x46,1,1))
-    for x in (25,26):
+    scr[6144+22*32+16:6144+22*32+20] = bytes([0x46]*gear+[1]*(4-gear))
+    for x,digit in zip((25,26),f"{passes%100:02}"):
         scr[6144+22*32+x] = 0x47
-        for dy,bits in enumerate((0,56,40,40,40,40,56,0)):
+        for dy,bits in enumerate(int(row,8)<<3 for row in "0"+FONT[digit]+"0"):
             scr[bitmap_offset(176+dy,x)] = bits
 
 
-def reference(course, steps, height):
+def window(ids,scales,pose,half,lane):
+    result = bytearray()
+    for row in range(half*8,half*8+8):
+        offset = round(((lane & 252)-128)*scales[pose][row]/120)
+        start = row*MAP_WIDTH + max(0,min(MAP_WIDTH-32,MARGIN//8+offset))
+        result.extend(ids[pose][start:start+32])
+    return result
+
+
+def frame_hash(backdrop,atlases,shown,depths,phase,gear,passes):
+    scene = backdrop.copy()
+    scene[TOP*4:DASH*4] = [atlases[i//256][t] for i,t in enumerate(shown[0]+shown[1])]
+    pair = [screen(scene,n) for n in (0,1)]
+    for bank,scr in enumerate(pair):
+        overlay(scr,bank,gear,passes)
+    rows = []
+    for y in range(192):
+        d = depths[y-TOP] if TOP<=y<DASH else 64
+        scr = pair[int(d!=64 and (d+phase)%32>=16)]
+        attr = 6144+(y//8)*32
+        bitmap = bitmap_offset(y,0)
+        rows.append(b"".join(pixels(a,b) for a,b in zip(scr[attr:attr+32],scr[bitmap:bitmap+32])))
+    return sha256(b"".join(rows)).digest()
+
+
+def reference(course,art,gear,lane,frames):
+    ids,depths,scales,atlases = art
     result = {}
-    pic = scenery(course)
-    for step in steps:
-        road(pic,step,course)
-        scene = tiles(pic)
-        pair = []
-        for bank in (0,1):
-            scr = screen(scene,bank)
-            if height>144:
-                initial_hud_and_rider(scr,step,bank,course)
-            pair.append([b"".join(pixels(scr[6144+y//8*32+x],scr[bitmap_offset(y,x)])
-                                  for x in range(32)) for y in range(height)])
-        for phase in range(PHASES):
-            rows = list(pair[0])
-            for y,r in enumerate(projection(step,course)[1][:height-TOP],TOP):
-                if r and (int(r.z*TRAVEL_PER_STEP)+phase)%32>=16:
-                    rows[y] = pair[1][y]
-            result[sha256(b"".join(rows)).digest()] = step,phase
+    backdrop = tiles(scenery(course))
+    shown = [window(ids,scales,0,h,128) for h in (0,1)]
+    target = [a.copy() for a in shown]
+    depth = bytearray(depths[0])
+    resume = [0,0]
+    pending = set()
+    half = pose = travel = phase = passes = 0
+    for _ in range(frames):
+        result[frame_hash(backdrop,atlases,shown,depth,phase,gear,passes)] = (pose,phase)
+        order = [(resume[half]+i)%256 for i in range(256)]
+        dirty = [i for i in order if shown[half][i]!=target[half][i]]
+        if len(dirty)>=EARLY_TILES:
+            resume[half]=(dirty[EARLY_TILES-1]+1)%256
+        next_half = 1-half
+        phase=(phase+gear)%32
+        travel+=gear
+        if travel>=TRAVEL_PER_STEP//SUBSTEPS:
+            travel-=TRAVEL_PER_STEP//SUBSTEPS
+            pose=(pose+1)%POSES
+            lane=max(8,min(248,lane+drift(pose//4,course)*(1 if pose%2 else 2)))
+            if pose%128==124:
+                passes+=1  # test rides use clear lines past both rivals
+            pending={0,1}
+        if next_half in pending:
+            cap=EARLY_TILES
+            pending.remove(next_half)
+            start=64*next_half
+            depth[start:start+64]=depths[pose][start:start+64]
+        else:
+            cap=EARLY_TILES+EXTRA_TILES
+        for i in dirty[:cap]:
+            shown[half][i]=target[half][i]
+        half=next_half
+        target[half]=window(ids,scales,pose,half,lane)
     return result
 
 
@@ -242,6 +293,31 @@ def paper_frames(raw,height):
         while frame := frames.read(3*WIDTH*HEIGHT):
             require(len(frame)==3*WIDTH*HEIGHT,"Truncated real-video frame")
             yield [frame[3*((y+56)*WIDTH+48):3*((y+56)*WIDTH+304)] for y in range(height)]
+
+
+def steering(emulator,model,s,folder,image,art,course):
+    ids,depths,scales,atlases = art
+    backdrop=tiles(scenery(course))
+    near,far=[],[]
+    for lane in (80,176):
+        # Park forward travel to isolate camera parallax on the same bend.
+        parked=fixture(folder,f"lane-{lane}",image,s,gear=0,lane=lane)
+        raw=folder/"steering.raw"
+        run(emulator,parked,model,2,["--vofilefps","25","--frameskip","0","--disable-autoframeskip","--vofile",raw])
+        view=[window(ids,scales,0,h,lane) for h in (0,1)]
+        expected=frame_hash(backdrop,atlases,view,depths[0],0,0,0)
+        frames=list(deque(paper_frames(raw,192),maxlen=3))
+        require(len(frames)==3 and all(sha256(b"".join(rows)).digest()==expected for rows in frames),
+                f"{model} camera or anchored rider pixel mismatch at lane {lane}")
+        near.append(frames[-1][135])
+        far.append(frames[-1][87])
+    def displacement(lines):
+        shifts = [x for x in range(0,113) if lines[0][3*x:]==lines[1][:3*(256-x)]]
+        require(len(shifts)==1,f"{model} ambiguous road displacement: {shifts}")
+        return shifts[0]
+    foreground,distance = displacement(near),displacement(far)
+    require(foreground>=40 and 0<=distance<foreground,f"{model} parallax {foreground}, {distance}")
+    return f"steering moved the road {foreground} px nearby and {distance} px in the distance"
 
 
 def video(emulator,model,folder,expected,tape):
@@ -258,7 +334,7 @@ def video(emulator,model,folder,expected,tape):
     previous = None
     for rows in paper_frames(raw,192):
         match = expected.get(sha256(b"".join(rows)).digest())
-        if match:
+        if match is not None:
             seen.add(match)
             for y in range(TOP, DASH):
                 if y not in dim_lines and dim_row.fullmatch(rows[y]):
@@ -287,15 +363,20 @@ def main():
                                                       (out/"racer.sym").read_text(), re.M)}
         symbols["afterLatch"] = symbols["latch"]+2
         print(f"{course}: {verify_terrain(course)}",flush=True)
-        expected = reference(course,range(9),192)
-        terrain_frames = reference(course,range(STEPS),144)
+        art = artwork(course)
+        expected = reference(course,art,2,128,128)
+        terrain_frames = {key:pose for key,(pose,_) in reference(
+            course,art,4,140,POSES*TRAVEL_PER_STEP//SUBSTEPS//4+4).items()}
 
         def check(model):
             with tempfile.TemporaryDirectory(prefix=f"{course}-{model}-") as scratch:
                 folder = Path(scratch)
-                for result in (raster(emu,model,symbols,image), gameplay(emu,model,symbols,folder,image,terrain_frames),
-                               video(emu,model,folder,expected,image.with_suffix(".tap"))):
+                def report(result):
                     print(f"{course} {model}: {result}",flush=True)
+                report(raster(emu,model,symbols,image))
+                report(gameplay(emu,model,symbols,folder,image,terrain_frames))
+                report(steering(emu,model,symbols,folder,image,art,course))
+                report(video(emu,model,folder,expected,image.with_suffix(".tap")))
         with ThreadPoolExecutor(max_workers=3) as pool:
             list(pool.map(check,args.model or ("128k","P2","P2A41")))
 

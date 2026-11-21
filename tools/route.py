@@ -83,7 +83,10 @@ def projection(step, course):
             continue
         if z == TYRES:
             near_direction = lateral/z
-        x = 128 + FOCAL * (lateral/z - near_direction)
+        bend = FOCAL * (lateral/z - near_direction)
+        # A gentle angular projection keeps far switchbacks from whipping
+        # across the very edge of the view as they emerge behind a brow.
+        x = 128 + bend / (1+(bend/230)**2)**.5
         h, _ = profile(step + z, course)
         y = SKYLINE + ((DASH-1-SKYLINE)*TYRES + FOCAL*(height-h))/z
         samples.append(Section(z, y, x))

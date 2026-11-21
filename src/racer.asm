@@ -1,41 +1,53 @@
 ; Spectrum Attribute Racer. Code, stack and raster tables live in fixed bank 2.
     device ZXSPECTRUM128
     include "layout.inc"
-    ; SP streams a 14-byte tile job. Both loops use the same fixed-cost stores.
-    macro BLIT_TILE
-        pop hl                      ; normal attribute address
-        pop de                      ; matching bitmap address
-        pop bc                      ; the two palettes
-        ld (hl),c
-        set 7,h
-        ld (hl),b
-        ex de,hl
-        ld e,l
-        ld d,h
-        set 7,d
-        dup 4
-            pop bc
-            ld a,c : ld (hl),a : ld (de),a : inc h : inc d
-            ld a,b : ld (hl),a : ld (de),a : inc h : inc d
-        edup
+BIKE_COL equ 14
+    ; Equal-length hit and miss paths. Collect the changed tile ID and its
+    ; column in two working pages of uncontended RAM while the ULA scans.
+    macro COMPARE_TILE slow
+        ld a,(de) : xor (hl)
+        if slow
+            jp z,1f
+        else
+            jr z,1f
+        endif
+        ld a,e : ld (bc),a : inc bc
+        ld a,(hl) : ld (bc),a : inc bc
+        jr 2f
+1:
+        if slow
+            dup 7
+                ld a,0
+            edup
+        else
+            dup 11
+                nop
+            edup
+        endif
+2:      inc l : inc e
     endm
-    ; Save the shared terrain bitmap and mask in the rider. On a solid dim
-    ; cell only the sprite's ink bits are visible. A two-colour dim cell
-    ; keeps its original palette and the composed edge. Both paths cost 4 T
-    ; between the bank 5 and bank 7 stores on every scanline.
-    macro RIDER_PIXELS cell, solid
-        ld h,#50 : ld d,#d0
-        dup 8, scan
-            ld a,(hl) : ld (underlay+cell*10+2+scan),a
-            pop bc : and c : or b : ld (hl),a
+    ; Recompose the anchored rider directly from the terrain tile. Both paths
+    ; write the two screens at the same time even in a mixed kerb cell.
+    macro RIDER_PIXELS row,col,solid
+        dup 8,line
+            ld a,(hl) : inc hl : pop bc : and c : or b
+            ld (#5000+row*32+col+BIKE_COL+64+line*256),a
             if solid
                 ld a,b
             else
                 nop
             endif
-            ld (de),a : inc h : inc d
+            ld (#d000+row*32+col+BIKE_COL+64+line*256),a
         edup
     endm
+    org #6000
+worldMap:   incbin "world.bin"
+bandScale:  incbin "scale0.bin"
+course:     include "course.inc"
+    align 256
+scroll:     incbin "scroll.bin"
+    assert $ <= #7000
+    savebin "working.bin",worldMap,$-worldMap
     org #8000
 start:
     di
@@ -53,55 +65,86 @@ start:
     ld a,#be
     ld i,a
     im 2
+    ld a,(shownMap) : ld h,a : ld l,0 : ld (dirty),hl
+    ld hl,dirty : ld de,dirty+2 : ld bc,2*EARLY_TILES-2 : ldir
     call updateHud
 frameWait:
     ei
     halt
     di
-    ; These two blits have identical instruction paths for all game states.
-    ; They finish before the first active display fetch (including on +2A).
     ld (restoreSP+1),sp
-    ld sp,jobs
-    ld a,TOP_TILES
+    ld sp,dirty
+    ld hl,riderSource : ld (afterJobs+1),hl
+    ld a,EARLY_TILES
 tileLoop:
     ex af,af'
-    BLIT_TILE
+    pop bc                      ; C is the cell and B its atlas tile ID
+drawHalf:
+    ld h,high shownMap
+    ld l,c : ld (hl),b
+    ld l,b
+drawAtlas:
+    ld h,high atlasLo0
+    ld a,(hl) : inc h : ld h,(hl) : ld l,a
+    ld (nextJob+1),sp : ld sp,hl
+    ld a,c : add a,RASTER_TOP*4 : ld l,a
+attrHalf:
+    ld a,#58
+    adc a,0 : ld h,a
+    ld e,l : rlca : rlca : rlca : and #18 : or #40 : ld d,a
+    pop bc
+    ld (hl),c : set 7,h : ld (hl),b
+    ex de,hl : ld e,l : ld d,h : set 7,d
+    dup 4
+        pop bc
+        ld a,c : ld (hl),a : ld (de),a : inc h : inc d
+        ld a,b : ld (hl),a : ld (de),a : inc h : inc d
+    edup
+nextJob:
+    ld sp,0
     ex af,af'
-    dec a
-    jp nz,tileLoop
+    dec a : jp nz,tileLoop
+afterJobs:
+    jp riderSource
 
 riderSource:
     ld sp,riderArt+162
-    ; Cache the underlying two attributes and shared bitmap before compositing.
-    ; POP BC supplies transparency mask C and solid ink bits B on each line.
     dup 3, ry
         dup 3, rx
-            ld a,(bikeCol) : add a,((18+ry)*32+rx) & 255 : ld l,a : ld e,a
-            ld h,#5a : ld d,#da
-            ld a,(hl) : ld (underlay+(ry*3+rx)*10),a
-            ld a,(de) : ld (underlay+(ry*3+rx)*10+1),a
-            pop bc : ld (hl),c              ; bright attribute, dim sprite ink
-            ld c,a                          ; original dim attribute
-            rrca : rrca : rrca : xor c : and 7
-            jp nz,1f                        ; different ink and paper
-            ld a,c : and #38 : or b : ld (de),a
-            RIDER_PIXELS (ry*3+rx),1
+            ld a,(shownMap+(18+ry-RASTER_TOP/8)*32+BIKE_COL+rx)
+            ld l,a : ld h,high atlasLo1
+            ld a,(hl) : inc h : ld h,(hl) : ld l,a
+            inc hl : pop bc : ld a,c : ld (#5800+(18+ry)*32+BIKE_COL+rx),a
+            ld a,(hl) : inc hl : ld c,a : rrca : rrca : rrca : xor c : and 7
+            jp nz,1f
+            ld a,c : and #38 : or b
+            ld (#d800+(18+ry)*32+BIKE_COL+rx),a
+            RIDER_PIXELS ry,rx,1
             jp 2f
-1:          dup 8                           ; match the 22 T setup + 10 T jump
-                nop
-            edup
-            RIDER_PIXELS (ry*3+rx),0
+1:          ld a,c : ld b,0 : nop
+            ld (#d800+(18+ry)*32+BIKE_COL+rx),a
+            RIDER_PIXELS ry,rx,0
+            jp 2f
 2:
         edup
     edup
 restoreSP:
     ld sp,0
 blitDone:
+calibrationJump:
+    jp measurePrelude
+calibrationReady:
     ; Calibrated from IM2 entry. No video RAM or I/O access in this delay.
-    ld bc,352
+scanSource:
+    ld hl,targetMap
+scanShown:
+    ld de,shownMap
+    ld bc,dirty
+    exx
+rasterDelay:
+    ld bc,90
 .align:
     dec bc : ld a,b : or c : jr nz,.align
-    ld a,0 : nop
     ld hl,activeDepth
     ld d,high portColours
     ld bc,#7ffd
@@ -115,35 +158,22 @@ phaseAdd:
     inc hl
 latch:
     out (c),a
-    ld a,9
-.delay:
-    dec a : jr nz,.delay
-    dup 3
-        ld a,0                  ; 21 T horizontal-blank padding
-    edup
+    exx
+    COMPARE_TILE 0
+    COMPARE_TILE 1
+    exx
     dec ixl
     jp nz,scanline              ; 228 T from OUT to OUT, including the final line
     ld a,#17
     out (c),a
 rasterDone:
-    ; The ULA has passed the rider. Restore the track before applying next
-    ; frame's updates, so a rival, a road marking and the rider can overlap.
-    dup 3, ry
-        dup 3, rx
-            ld a,(bikeCol) : add a,((18+ry)*32+rx) & 255 : ld l,a : ld e,a
-            ld h,#5a : ld d,#da
-            ld a,(underlay+(ry*3+rx)*10) : ld (hl),a
-            ld a,(underlay+(ry*3+rx)*10+1) : ld (de),a
-            ld h,#50 : ld d,#d0
-            dup 8, scan
-                ld a,(underlay+(ry*3+rx)*10+2+scan) : ld (hl),a : ld (de),a
-                inc h : inc d
-            edup
-        edup
-    edup
+    exx : ld (dirtyEnd),bc : exx
+    call finishList
     call controls
     call advance
-    call prepareTiles
+    call applyHalf
+    call viewport
+    call extraTiles
     call updateHud
     jp frameWait
 
@@ -154,24 +184,8 @@ controls:
     cpl
     and 3
     ld d,a
-    ld a,(steerTimer)
-    or a
-    jr z,.canSteer
-    dec a
-    ld (steerTimer),a
-    jr .lean
-.canSteer:
-    ld a,d
-    cp 1
-    call z,steerRight
-    ld a,d
-    cp 2
-    call z,steerLeft
-    ld a,d
-    or a
-    jr z,.lean
-    ld a,2
-    ld (steerTimer),a
+    ld a,d : cp 1 : call z,steerRight
+    ld a,d : cp 2 : call z,steerLeft
 .lean:
     ld a,d
     cp 1
@@ -213,106 +227,173 @@ controls:
     ret
 
 steerLeft:
-    ld a,(bikeCol)
-    or a : ret z
-    dec a : ld (bikeCol),a : ret
+    ld a,(lane) : cp 10 : ret c
+    sub 2 : ld (lane),a : ret
 steerRight:
-    ld a,(bikeCol)
-    cp 29 : ret z
-    inc a : ld (bikeCol),a : ret
+    ld a,(lane) : cp 247 : ret nc
+    add a,2 : ld (lane),a : ret
+
+finishList:
+    ld a,(scanHalf) : add a,high shownMap : ld (drawHalf+1),a
+    ld a,(scanHalf) : add a,#58 : ld (attrHalf+1),a
+    ld a,(scanHalf) : add a,a : add a,high atlasLo0 : ld (drawAtlas+1),a
+    xor a : ld (overflow),a
+    ld hl,(dirtyEnd) : ld de,dirty : or a : sbc hl,de
+    ld a,h : or a : jr nz,fullList
+    ld a,l : cp EARLY_TILES*2 : jr nc,fullList
+    or a : jr nz,.pad
+    ld hl,(scanShown+1) : ld a,l : ld (dirty),a
+    ld a,(hl) : ld (dirty+1),a
+    ld a,2
+.pad:
+    ; Repeat the first valid job to keep the pre-raster blit cycle-exact.
+    ; Each PUSH fills a complete record while the screens are idle.
+    rrca : ld e,a : ld d,0 : ld hl,padJobs : add hl,de
+    ld de,(dirty) : ld (padSP+1),sp : ld sp,dirty+EARLY_TILES*2
+    jp (hl)
+padJobs:
+    dup EARLY_TILES
+        push de
+    edup
+padSP:
+    ld sp,0 : jr nextHalf
+fullList:
+    srl h : rr l : ld a,l : sub EARLY_TILES : ld (overflow),a
+    ; Resume beyond the final published cell when this half returns.
+    ld a,(scanHalf) : ld e,a : ld d,0 : ld hl,resumeCol : add hl,de
+    ld a,(dirty+(EARLY_TILES-1)*2) : inc a : ld (hl),a
+nextHalf:
+    ld a,(scanHalf) : xor 1 : ld (scanHalf),a
+    ld e,a : ld d,0 : ld hl,resumeCol : add hl,de : ld l,(hl)
+    ld h,a : ld a,high shownMap : add a,h : ld (scanShown+2),a
+    ld a,high targetMap : add a,h : ld (scanSource+2),a
+    ld a,l : ld (scanShown+1),a : ld (scanSource+1),a
+    ret
 
 advance:
-    ld a,(bikeCol)
-    or a : jr z,.grass
-    cp 29 : jr c,.travel
+    ld a,(lane) : cp 18 : jr c,.grass : cp 239 : jr c,.travel
 .grass:
     ld a,1 : ld (gear),a
 .travel:
     ld a,(gear) : ld b,a
-    ld a,(phase) : add a,b : and 31 : ld (phase),a
-    ld (phaseAdd+1),a
-    ld a,(travel) : add a,b
-    cp TRAVEL_PER_STEP
+    ld a,(phase) : add a,b : and 31 : ld (phase),a : ld (phaseAdd+1),a
+    ld a,(travel) : add a,b : cp SUBSTEP_TRAVEL
     jr nc,.next
     ld (travel),a : ret
 .next:
-    sub TRAVEL_PER_STEP : ld (travel),a
-    ld a,(step) : inc a : and 63 : ld (step),a
+    sub SUBSTEP_TRAVEL : ld (travel),a
+    ld a,(pose) : inc a : ld (pose),a
 .descriptor:
-    ld l,a : ld h,0 : add hl,hl : add hl,hl : add hl,hl
+    ld l,a : ld h,0 : add hl,hl : add hl,hl
     ld de,course : add hl,de
-    ld a,(hl) : or #10 : ld (dataPage),a : inc hl
-    ld a,(hl) : ld (batches),a : inc hl
-    ld a,(hl) : ld (rivalX),a : inc hl
-    ld c,(hl) : inc hl
-    ld e,(hl) : inc hl : ld d,(hl) : inc hl : ld (cursor),de
-    ld e,(hl) : inc hl : ld d,(hl) : ld (depthSource+1),de
-    ld a,c : or a : ret z
-    jp p,steerRight
-    jp steerLeft
+    ld e,(hl) : inc hl : ld d,(hl) : inc hl
+    ld a,(hl) : ld (bankValue+1),a : inc hl : ld bc,#7ffd : out (c),a
+    ld a,(lane) : add a,(hl) : cp 8 : jr nc,.upper : ld a,8
+.upper:
+    cp 249 : jr c,.lane : ld a,248
+.lane:
+    ld (lane),a
+    ex de,hl
+    ld e,(hl) : inc hl : ld d,(hl) : inc hl
+    ld (upperPatch+1),hl : add hl,de : ld (lowerPatch+1),hl
+    ld a,3 : ld (pending),a
+    ld bc,#7ffd : ld a,#17 : out (c),a
+    ld a,(pose) : and 127 : cp 124 : ret nz
 judgePass:
-    ; Once per pass, compare centres at the rider's depth.
-    ld a,(step) : and 31 : cp 31 : ret nz
-    ld a,(rivalX) : ld b,a
-    ld a,(bikeCol) : add a,a : add a,a : add a,a : add a,12
-    sub b : add a,12 : cp 25
-    jr nc,.clear
-    ld a,1 : ld (gear),a
-    ld a,20 : ld (bump),a : ret
+    ; The bike is anchored at X=124. Lane is the world-space camera offset.
+    ld a,(pose) : and 128 : ld b,78 : jr z,.left
+    ld b,186
+.left:
+    ld a,(lane) : sub b : add a,12 : cp 25 : jr nc,.clear
+    ld a,1 : ld (gear),a : ld a,20 : ld (bump),a : ret
 .clear:
     ld a,(passes) : add a,1 : daa : ld (passes),a : ret
 
-prepareTiles:
-    ld a,(batches) : or a : ret z
-    dec a : ld (batches),a
-    ld (streamSP+1),sp
-    ld sp,(cursor)
-    ld a,(dataPage)
-    ld bc,#7ffd : out (c),a
-    pop hl : ld (depthSlice+1),hl
-    ld de,jobs
-    ld a,BATCH_TILES
-.tile:
-    ex af,af'
-    pop hl                      ; attribute low byte is also bitmap low byte
-    ld a,l : ld (de),a : inc de
-    ld a,h : ld (de),a : inc de
-    ld a,l : ld (de),a : inc de
-    ld a,h : rlca : rlca : rlca : and #18 : or #40 : ld (de),a : inc de
-    pop hl
-    dup 10
+applyHalf:
+    ld a,EXTRA_TILES : ld (extraLimit),a
+    ld a,(scanHalf) : or a : jr nz,applyLower
+    ld a,(pending) : bit 0,a : ret z
+    res 0,a : ld (pending),a
+upperPatch:
+    ld hl,0
+    ld de,worldMap : ld ix,activeDepth : jr patchPage
+applyLower:
+    ld a,(pending) : bit 1,a : ret z
+    res 1,a : ld (pending),a
+lowerPatch:
+    ld hl,0
+    ld de,worldMap+8*MAP_WIDTH : ld ix,activeDepth+64
+patchPage:
+    ld bc,#7ffd
+bankValue:
+    ld a,0 : out (c),a
+patchLoop:
+    ld a,(hl) : inc hl : or a : jr z,patchDepth
+    jp m,.literal
+    add a,e : ld e,a : jr nc,patchLoop : inc d : jr patchLoop
+.literal:
+    and 127 : ld c,a : ld b,0 : ldir : jr patchLoop
+patchDepth:
+    push ix : pop de
+    dup 64
         ldi
     edup
-    ex af,af'
-    dec a : jp nz,.tile
-    ld (cursor),sp
-    ld bc,#7ffd : ld a,#17 : out (c),a
-    ; The beam has passed the road and the previous rider is restored. Apply
-    ; the tail of the batch here, then the rest before the next active display.
-    ld sp,jobs+TOP_TILES*14
-    ld a,BOTTOM_TILES
-.bottomTile:
-    ex af,af'
-    BLIT_TILE
-    ex af,af'
-    dec a : jp nz,.bottomTile
-streamSP:
-    ld sp,0
-    ; Bank 7 now holds the shadow screen and the pose depth maps. During
-    ; the raster, all tables read by the CPU are in uncontended bank 2.
-depthSource:
-    ld hl,0
-depthSlice:
-    ld bc,0                     ; C = first scanline, B = number to copy
-    ld d,0 : ld e,c : add hl,de
-    ld d,high activeDepth
-    ld c,b : ld b,0 : ldir
-    ld a,(batches) : or a : ret nz
-    jp judgePass
+    ld de,bandScale : ld a,(scanHalf) : or a : jr z,.scale
+    ld de,bandScale+8
+.scale:
+    dup 8
+        ldi
+    edup
+    xor a : ld (extraLimit),a
+    ld bc,#7ffd : ld a,#17 : out (c),a : ret
+
+extraTiles:
+    ld a,(overflow) : or a : ret z
+    ld hl,extraLimit : cp (hl) : jr c,.count : ld a,(hl)
+.count:
+    or a : ret z
+    ld (lateSP+1),sp : ld sp,dirty+2*EARLY_TILES
+    ld hl,lateSP : ld (afterJobs+1),hl
+    jp tileLoop
+lateSP:
+    ld sp,0 : ret
+
+    macro VIEW_BAND row
+        ld a,(bandScale+row)
+        rrca : rrca : ld h,a : and #c0 : or c : ld l,a
+        ld a,h : and 3 : add a,high scroll : ld h,a : ld a,(hl)
+        ld hl,worldMap+row*MAP_WIDTH
+        add a,l : ld l,a : jr nc,1f : inc h
+1:      dup 32
+            ldi
+        edup
+        ; LDI consumes BC, restore the lane index for the next strip.
+        ld a,(lane) : rrca : rrca : and 63 : ld c,a
+    endm
+viewport:
+    ld a,(lane) : rrca : rrca : and 63 : ld c,a
+    ld a,(scanHalf) : or a : jp nz,.lower
+    ld de,targetMap
+    dup 8,y
+        VIEW_BAND y
+    edup
+    ret
+.lower:
+    ld de,targetMap+256
+    dup 8,y
+        VIEW_BAND (y+8)
+    edup
+    ret
 
 updateHud:
     ; The ULA reads the dashboard from bank 5 alone.
     ld a,(gear) : ld b,a
+    ld a,(hudGear) : cp b : jr nz,.draw
+    ld a,(passes) : ld hl,hudPass : cp (hl) : jr nz,.draw
+    ld a,(bump) : or a : ret z
+.draw:
+    ld a,b : ld (hudGear),a
+    ld a,(passes) : ld (hudPass),a
     ld hl,#5800+22*32+16
     ld c,4
 .bars:
@@ -323,7 +404,7 @@ updateHud:
 .bar:
     ld (hl),a : inc hl : dec c : jr nz,.bars
     ld a,(bump) : or a : jr z,.steady
-    dec a : ld (bump),a : ld a,#42
+    dec a : ld (bump),a : ld a,255 : ld (hudGear),a : ld a,#42
     jr .passColour
 .steady:
     ld a,#47
@@ -341,41 +422,73 @@ digit:
     edup
     ret
 
-bikeCol:    db 14
+    ; Measure the prelude against an entire ULA frame once. Both the probe
+    ; and the border delay use 26-T loops in fixed RAM. This also accounts for
+    ; the different visible-display contention on the +2A.
+measurePrelude:
+    ld hl,calibrationReady : ld (calibrationJump+1),hl
+    ld hl,finishMeasure : ld (irq+1),hl
+    ld hl,0 : ei
+.count:
+    inc hl : nop : nop : jr .count
+finishMeasure:
+    di : pop de
+    ld de,1828 : or a : sbc hl,de : ld (rasterDelay+1),hl
+    ld hl,irqReturn : ld (irq+1),hl
+    jp frameWait
+irqReturn:
+    ei : ret
+
+lane:       db 128
 gear:       db 2
 phase:      db 0
 travel:     db 0
-step:       db 0
+pose:       db 0
 passes:     db 0
 bump:       db 0
-steerTimer: db 0
 gearTimer:  db 0
-batches:    db 0
-dataPage:   db 0
-rivalX:     db 0
-cursor:     dw 0
-underlay:   ds 90
-jobs:
-    dup BATCH_TILES
-        dw #5800,#4000,0       ; black sky cell while the initial queue is empty
-        ds 8
-    edup
-course:     include "course.inc"
+scanHalf:   db 0
+resumeCol:  dw 0
+dirtyEnd:   dw dirty
+hudGear:    db 255
+hudPass:    db 0
+pending:    db 0
+overflow:   db 0
+extraLimit: db 0
+dirty:      ds 512
+
 riderArt:   incbin "riders.bin"
 digits:     incbin "digits.bin"
     align 256
-activeDepth: incbin "depths.bin",0,DASH-RASTER_TOP
+activeDepth: incbin "depth0.bin"
     align 256
 portColours:
     dup 64, stripe
         db #17 + ((stripe & 16) >> 1)
     edup
-    ds 32,#17                  ; sky sentinel 64 + distance phase
-    assert $ <= SHARED_FAST
-    org SHARED_FAST
-    incbin "shared-fast.bin"
+    ds 32,#17
+    align 256
+shownMap:   incbin "shown.bin"
+targetMap:  incbin "shown.bin"
+
+atlasLo0:
+    dup 256,id
+        db low (atlas0+id*10)
+    edup
+    dup 256,id
+        db high (atlas0+id*10)
+    edup
+atlasLo1:
+    dup 256,id
+        db low (atlas1+id*10)
+    edup
+    dup 256,id
+        db high (atlas1+id*10)
+    edup
+atlas0:     incbin "atlas0.bin"
+atlas1:     incbin "atlas1.bin"
     assert $ < #bd00
     org #bfbf
 irq:
-    ei : ret
+    jp irqReturn
     savebin "core.bin",start,$-start

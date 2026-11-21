@@ -1,6 +1,6 @@
 # Spectrum Attribute Racer
 
-Two motorcycle circuits for the ZX Spectrum 128K. Countersteer through bends, watch for riders coming back into view over crests, and pass on either side. Contact or running wide drops the bike to first gear. Each clean overtake adds one to the dashboard counter.
+Two motorcycle circuits for the ZX Spectrum 128K. The camera follows the bike from behind. Steer to move the road under the tyres, watch for riders coming back into view over crests, and pass on either side. Contact or running wide drops the bike to first gear. Each clean overtake adds one to the dashboard counter.
 
 | Circuit | Ride | Emulator capture |
 | --- | --- | --- |
@@ -15,7 +15,7 @@ Open either TAP with tape autoload on a 128K Spectrum, +2 or +2A emulator. Enabl
 
 | Keys | Action |
 | --- | --- |
-| O / P | Steer and lean left / right |
+| O / P | Steer left / right. The bike leans near the centre and the foreground road shifts underneath it. |
 | Q / A | Shift up / down through four gears |
 
 ## Build and test
@@ -33,15 +33,16 @@ Both commands accept `--course coast` or `--course ridge`. The verifier also acc
 
 The starting point was the shmup's Ringo-8/Blokius renderer. An interrupt synchronises the frame, and scheduled writes to `#7FFD` let the ULA fetch colours from either screen. The racer has its own raster loop, course compiler and sprite compositor. [Shmup source and timing measurements](https://github.com/johnparker007/SpectrumAttributeShmup/blob/b9f0878/docs/timing-baseline.md)
 
-* Each circuit has a closed profile of elevation and signed curvature. For each of 64 rider positions, the compiler projects road sections from near to far. Each scanline takes its nearest visible surface. A crest can hide a whole valley, the lower half of a sign or an approaching rider. The distance of the visible road also sets the stripe spacing and kerb width.
-* Both screen banks hold the road bitmap. The bright bands use green grass, white kerbs and black asphalt with white lane dashes. The alternating dim bands use normal green, red, blue, red and green across the screen. The dashes blend into the blue asphalt. The kerbs reach 36 pixels at the tyres. Their edges can move up to five pixels towards an attribute boundary to reduce colour clash.
-* The Z80 selects a screen in the horizontal border before each of 128 scanlines. Sky lines select the scenic background. Road lines look up the current depth plus a phase that advances with gear at 50 Hz.
-* The rider saves the track underneath its 24×24 masked bitmap. Once the beam passes the bike, the game restores the background, reads the keyboard and stages up to 29 changed tiles. It writes six behind the beam and 23 before active display after the next IM 2 interrupt. Each batch also refreshes the corresponding scanline depths. Common tile graphics occupy fixed RAM, and five pageable banks hold the course updates.
+* Each circuit has a closed elevation and curvature profile. The compiler projects 256 camera positions around the lap at quarter-station intervals. At each position a scanline takes the nearest visible ground. A crest can hide a valley, a sign or an approaching rider. A gentle angular compression at the edges of the field of view softens the reveal of distant switchbacks.
+* The camera has its own lateral position. O and P move it across the road, and curvature pushes it outwards over successive quarter-steps. Each eight-line strip samples a 480-pixel-wide road at an offset proportional to its visible depth. The foreground moves the most. The 24�24 rider is composited from the underlying terrain every frame with neutral centre at x=124 on the 256-pixel display.
+* Both screen banks hold the road bitmap. The bright bands use green grass, white kerbs and black asphalt with white lane dashes. The dim bands use normal green, red, blue, red and green across the screen. Strip positions use the Spectrum's eight-pixel attribute grid. The compiled tile graphics retain the kerbs' pixel edges within a strip. A small threshold holds an edge tile until its accumulated change is visible.
+* The 50 Hz raster chooses a screen in the horizontal border before each of 128 scanlines. Between switches it compares 256 visible tiles from one half of the road with the requested view. It alternates halves each frame and resumes at the first unprocessed area when a large bend or a steering input changes many tiles. A fixed batch is drawn before the next road raster, with additional tiles drawn behind the beam when the course data is already current.
+* Each quarter-step has two independently decodable sets of tile changes, scanline depths and steering scales. In second gear the road takes a new position every seven display frames. In fourth it alternates between three and four frames. Striping, steering input and rider lean update every display frame.
 
 Edit the course profiles and projection in [tools/route.py](tools/route.py), scenery and tile conversion in [tools/course.py](tools/course.py), and the running game in [src/racer.asm](src/racer.asm).
 
 ## Timing checks
 
-The verifier boots both release tapes through the ROM loader and compares real-video pixels with the expected two-screen composite. Separate snapshot runs check the terrain around a full lap, keyboard controls, both overtakes, contact penalties and the time remaining before the next interrupt.
+The verifier boots both release tapes through the ROM loader and checks the real-video image. A separate top-gear run compares the moving picture with the expected camera, rider, road and dashboard throughout a lap, including partially redrawn bends. Parked left- and right-lane fixtures check the amount and direction of foreground and distant movement against captured pixels. Keyboard, overtakes, contact and interrupt deadlines are checked separately.
 
-Measured with SjASMPlus 1.20.2 and ZEsarUX 10.3 on the 128K, grey +2 and +2A emulations. The first road latch falls at T-states 23,452–23,455 relative to frame start. Successive road latches are 228 T-states apart.
+The program measures its drawing time against the ULA interrupt at startup to locate the horizontal border on each machine. Successive road latches are 228 T-states apart on the 128K, grey +2 and +2A in ZEsarUX 10.3.
