@@ -16,7 +16,8 @@ PAGES = (0, 1, 3, 4, 6)
 
 # Each material specifies its colour on the two screen banks. Bit 3 is BRIGHT.
 VOID, GRASS, TEAL, KERB, PAINT, STEEL, LAMP, RUBY = range(8)
-MATERIALS = [(0, 0), (4, 12), (13, 13), (15, 10), (15, 0), (7, 7),
+# Grass shares BRIGHT with the white kerb and normal intensity with the red.
+MATERIALS = [(0, 0), (12, 4), (13, 13), (15, 2), (15, 0), (7, 7),
              (14, 14), (10, 10)]
 STATIC = len(MATERIALS)
 MATERIALS += [(i, i) for i in range(16)]
@@ -106,30 +107,41 @@ def centre(step, d):
 
 
 def kerb_width(d):
-    return 2 * (1 + d//18)
+    return 6 + round(30 * d / (DASH - HORIZON - 1))
 
 
-def shoulder_width(d):
-    # At the steepest bend an edge travels about 15 pixels over eight lines.
-    # Leave another cell width so grass and kerb can each pair with black.
-    return 22 + d//16
+def kerb_starts(step, first_depth, side):
+    """Project eight scanlines of one stripe, keeping its two edges in separate cells."""
+    spans = []
+    for d in range(first_depth, first_depth + 8):
+        width = kerb_width(d)
+        inner = round(centre(step, d) + side * halfwidth(d))
+        start = inner - width if side < 0 else inner + 1
+        spans.append((start, start + width))
+    # Pick the cell boundary nearest the overlap of the eight projected spans.
+    # On a tight distant bend, move only the rows that would miss it. The
+    # stripe retains its full width and no cell needs green, paint and black.
+    latest_start = max(lo for lo, _ in spans)
+    earliest_end = min(hi for _, hi in spans)
+    seam = 8 * round((latest_start + earliest_end) / 16)
+    return [max(seam - (hi - lo), min(lo, seam)) for lo, hi in spans]
 
 
 def road(pic, step):
-    for y in range(HORIZON, DASH):
-        d = y - HORIZON
-        row = pic[y]
-        row[:] = bytes([GRASS]) * WIDTH
-        mid, w = centre(step, d), halfwidth(d)
-        left, right = round(mid-w), round(mid+w)
-        kerb = kerb_width(d)
-        apron = shoulder_width(d)
-        span(row, left-kerb-apron, right+kerb+apron+1, VOID)
-        span(row, left-kerb, left, KERB)
-        span(row, right+1, right+kerb+1, KERB)
-        for sign in (-1, 1):
-            mark = round(mid + sign*w*0.36)
-            span(row, mark, mark+1+d//58, PAINT)
+    for first in range(0, DASH-HORIZON, 8):
+        left = kerb_starts(step, first, -1)
+        right = kerb_starts(step, first, 1)
+        for line, (lo, hi) in enumerate(zip(left, right)):
+            d = first + line
+            row = pic[HORIZON + d]
+            row[:] = bytes([GRASS]) * WIDTH
+            width = kerb_width(d)
+            span(row, lo, lo + width, KERB)
+            span(row, lo + width, hi, VOID)
+            span(row, hi, hi + width, KERB)
+            for side in (-1, 1):
+                mark = round(centre(step, d) + side * halfwidth(d) * 0.36)
+                span(row, max(lo + width + 1, mark), min(hi - 1, mark + 1 + d//58), PAINT)
 
     # Two sets of roadside bollards, planted at equal world-space intervals.
     for distance in sorted(((1-(step/16 + offset) % 1) for offset in (0, 0.5)), reverse=True):
@@ -137,8 +149,8 @@ def road(pic, step):
         if d >= DASH-HORIZON:
             continue
         for sign in (-1, 1):
-            verge = halfwidth(d) + kerb_width(d) + shoulder_width(d)
-            # Keep the post and its whole sign clear of the grass/black cells.
+            verge = halfwidth(d) + kerb_width(d)
+            # Keep the post and its whole sign clear of the grass/kerb cells.
             x = round(centre(step,d) + sign*(verge + 24 + d//8))
             h, w = max(2, d//5), max(1, d//28)
             for dy in range(h):
@@ -181,13 +193,14 @@ def encode(cell):
     # Both banks share a bitmap. Pick two materials for this cell, allowing the
     # bitmap edge to cross an attribute boundary at single-pixel precision.
     count = Counter(cell)
+    if KERB in count and VOID in count and len(count) > 2 and GRASS not in count:
+        # A distant rider can occupy the same cell as the inner edge. Draw
+        # its highlights in the kerb ink so both silhouettes survive the swap.
+        cell = bytes(VOID if m in (VOID, PAINT) else KERB for m in cell)
+        count = Counter(cell)
     weights = {KERB: 4, PAINT: 4, STEEL: 5, LAMP: 6, RUBY: 6, TEAL: 5}
     ranked = sorted(count, key=lambda m: count[m]*weights.get(m, 1), reverse=True)
     paper, ink = ranked[0], ranked[min(1,len(ranked)-1)]
-    # At the vanishing point a lane dash can share a kerb cell. Preserve the
-    # painted silhouette there; traffic still uses the usual sprite priorities.
-    if count.keys() == {VOID, KERB, PAINT}:
-        paper, ink = VOID, KERB
     # The rider keeps background set bits under the transparent part of its
     # mask. Keep the black asphalt clear even in a mostly painted edge cell.
     if ink == VOID:
