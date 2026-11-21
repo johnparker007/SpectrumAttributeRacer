@@ -14,6 +14,7 @@ from build import BUILD, executable
 from course import (ASPHALT, KERB, KERB_ATTRS, MATERIALS, PAINT, PHASES, TRAVEL_PER_STEP,
                     artwork, bitmap_offset, riders, road, scenery, screen, tiles, visible,
                     EARLY_TILES, EXTRA_TILES, FONT, MAP_WIDTH, MARGIN, POSES, SUBSTEPS)
+from kerbs import FIRST_BAND, geometry, overlay_kerbs
 from route import COURSES, DASH, STEPS, TOP, TYRES, drift, projection
 
 FRAME, LINE = 70908, 228
@@ -145,8 +146,49 @@ def pixels(attr, bits):
     return b"".join(colours[bool(bits & (128>>bit))] for bit in range(8))
 
 
+def verify_joins(course, art):
+    # Measure the red stripe actually encoded in the bank-7 bitmap against
+    # the continuous road, independently of the game's stamp lookup.
+    ids,_,scales,atlases,stamps = art
+    red = [[bytes(((t[1] >> (0 if bits & (128>>x) else 3)) & 7)==2 for x in range(8))
+            for bits in t[2:]] for t in atlases[1]]
+    joins = steps = absent = 0
+    for pose in range(POSES):
+        bands = geometry(pose,course)
+        rows = projection(pose/SUBSTEPS,course)[1]
+        for lane in (80,104,128,140,176):
+            view = window(ids,scales,pose,1,lane,course,stamps)
+            for k in range(1,8):
+                if not (bands[k-1].use_stamp and bands[k].use_stamp):
+                    continue
+                samples = []
+                for i,dy in ((k-1,7),(k,0)):
+                    r = rows[64+i*8+dy]
+                    mask = b"".join(red[t][dy] for t in view[32*i:32*i+32])
+                    runs = [(m.start()+m.end()-1)/2 for m in re.finditer(b"\x01+",mask)
+                            if m.start() and m.end()<256 and m.end()-m.start()>=r.kerb/2]
+                    samples.append((r,runs))
+                for side in (-1,1):
+                    errors = []
+                    for r,runs in samples:
+                        centre = r.x+side*(r.halfwidth+(r.kerb+1)/2)-(lane-128)*TYRES/r.z
+                        if not 12<centre<244:
+                            break
+                        errors.append(min((x-centre for x in runs),key=abs,default=256))
+                    if len(errors)<2:
+                        continue
+                    joins += 1
+                    if max(map(abs,errors))>12:
+                        absent += 1
+                    elif abs(errors[1]-errors[0])>4:
+                        steps += 1
+    require(joins>10000 and (steps+absent)/joins<.09,
+            f"{course} foreground joins: {steps} excessive steps, {absent} obscured of {joins}")
+    return f"{steps} steps over 4 px and {absent} obscured in {joins} foreground joins"
+
+
 def verify_terrain(course, art):
-    ids,_,_,atlases = art
+    ids,_,_,atlases,_ = art
     kerb_rows = missing_rows = 0
     pic = scenery(course)
     crests, centres, depth_jumps = [], [], []
@@ -183,7 +225,7 @@ def verify_terrain(course, art):
                     crowded_cells += 1  # A depth break can put a third material in a ULA cell.
                     continue
                 simple_cells += 1
-                if tile[:2]==KERB_ATTRS:
+                if tile[:2]==KERB_ATTRS and (y-TOP)//8<FIRST_BAND:
                     band = (y-TOP)//8
                     tile_id = ids[step*SUBSTEPS][band*MAP_WIDTH+MARGIN//8+col]
                     stored = atlases[band//8][tile_id]
@@ -234,13 +276,13 @@ def overlay(scr, bank, gear, passes):
             scr[bitmap_offset(176+dy,x)] = bits
 
 
-def window(ids,scales,pose,half,lane):
+def window(ids,scales,pose,half,lane,course,stamps):
     result = bytearray()
     for row in range(half*8,half*8+8):
         offset = round(((lane & 252)-128)*scales[pose][row]/120)
         start = row*MAP_WIDTH + max(0,min(MAP_WIDTH-32,MARGIN//8+offset))
         result.extend(ids[pose][start:start+32])
-    return result
+    return overlay_kerbs(result,pose,lane,course,stamps) if half else result
 
 
 def frame_hash(backdrop,atlases,shown,depths,phase,gear,passes):
@@ -260,14 +302,15 @@ def frame_hash(backdrop,atlases,shown,depths,phase,gear,passes):
 
 
 def reference(course,art,gear,lane,frames):
-    ids,depths,scales,atlases = art
+    ids,depths,scales,atlases,stamps = art
     result = {}
     backdrop = tiles(scenery(course))
-    shown = [window(ids,scales,0,h,128) for h in (0,1)]
+    shown = [window(ids,scales,0,h,128,course,stamps) for h in (0,1)]
     target = [a.copy() for a in shown]
     depth = bytearray(depths[0])
     resume = [0,0]
     pending = set()
+    cached_lower = (0,128)
     half = pose = travel = phase = passes = 0
     for _ in range(frames):
         result[frame_hash(backdrop,atlases,shown,depth,phase,gear,passes)] = (pose,phase)
@@ -292,10 +335,15 @@ def reference(course,art,gear,lane,frames):
             depth[start:start+64]=depths[pose][start:start+64]
         else:
             cap=EARLY_TILES+EXTRA_TILES
+        if next_half:
+            state = (pose,lane & 252)
+            if state!=cached_lower:
+                cap=EARLY_TILES
+            cached_lower=state
         for i in dirty[:cap]:
             shown[half][i]=target[half][i]
         half=next_half
-        target[half]=window(ids,scales,pose,half,lane)
+        target[half]=window(ids,scales,pose,half,lane,course,stamps)
     return result
 
 
@@ -307,7 +355,7 @@ def paper_frames(raw,height):
 
 
 def steering(emulator,model,s,folder,image,art,course):
-    ids,depths,scales,atlases = art
+    ids,depths,scales,atlases,stamps = art
     backdrop=tiles(scenery(course))
     near,far=[],[]
     for lane in (80,176):
@@ -315,18 +363,26 @@ def steering(emulator,model,s,folder,image,art,course):
         parked=fixture(folder,f"lane-{lane}",image,s,gear=0,lane=lane)
         raw=folder/"steering.raw"
         run(emulator,parked,model,2,["--vofilefps","25","--frameskip","0","--disable-autoframeskip","--vofile",raw])
-        view=[window(ids,scales,0,h,lane) for h in (0,1)]
+        view=[window(ids,scales,0,h,lane,course,stamps) for h in (0,1)]
         expected=frame_hash(backdrop,atlases,view,depths[0],0,0,0)
         frames=list(deque(paper_frames(raw,192),maxlen=3))
         require(len(frames)==3 and all(sha256(b"".join(rows)).digest()==expected for rows in frames),
                 f"{model} camera or anchored rider pixel mismatch at lane {lane}")
-        near.append(frames[-1][135])
+        line = frames[-1][135]
+        r = projection(0,course)[1][135-TOP]
+        centre = r.x-r.halfwidth-r.kerb/2-(lane-128)*TYRES/r.z
+        # Track the middle of the painted left kerb in real video. Lane dashes
+        # and roadside objects use a separate, coarser steering offset.
+        mask = bytes(line[x:x+3] in (b"\xff"*3,b"\0\0\xc0") for x in range(0,len(line),3))
+        runs = [(m.start()+m.end()-1)/2 for m in re.finditer(b"\x01{4,}",mask)]
+        require(runs,f"{model} missing foreground kerb at lane {lane}")
+        near.append(min(runs,key=lambda x:abs(x-centre)))
         far.append(frames[-1][87])
     def displacement(lines):
         shifts = [x for x in range(0,113) if lines[0][3*x:]==lines[1][:3*(256-x)]]
         require(len(shifts)==1,f"{model} ambiguous road displacement: {shifts}")
         return shifts[0]
-    foreground,distance = displacement(near),displacement(far)
+    foreground,distance = near[0]-near[1],displacement(far)
     require(foreground>=40 and 0<=distance<foreground,f"{model} parallax {foreground}, {distance}")
     return f"steering moved the road {foreground} px nearby and {distance} px in the distance"
 
@@ -379,7 +435,7 @@ def main():
                                                       (out/"racer.sym").read_text(), re.M)}
         symbols["afterLatch"] = symbols["latch"]+2
         art = artwork(course)
-        print(f"{course}: {verify_terrain(course,art)}",flush=True)
+        print(f"{course}: {verify_terrain(course,art)}; {verify_joins(course,art)}",flush=True)
         expected = reference(course,art,2,128,128)
         terrain_frames = {key:pose for key,(pose,_) in reference(
             course,art,4,140,POSES*TRAVEL_PER_STEP//SUBSTEPS//4+4).items()}

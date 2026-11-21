@@ -6,6 +6,8 @@ from math import cos, sin
 from pathlib import Path
 from struct import pack
 
+from kerbs import (FIRST_BAND, MATH_ADDR, SHIFT_ADDR, SLOPES, STAMP_ADDR, WIDTHS, geometry, geometry_data, masks,
+                   math_data, overlay_kerbs, stamp_data)
 from route import DASH, STEPS, TOP, TYRES, at_distance, drift, profile, projection
 
 WIDTH, HEIGHT = 256, 192
@@ -15,7 +17,7 @@ SUBSTEPS = 4
 POSES = STEPS * SUBSTEPS
 MARGIN = 112
 MAP_WIDTH = 32 + 2*MARGIN//8
-EARLY_TILES, EXTRA_TILES = 33, 18
+EARLY_TILES, EXTRA_TILES = 30, 18
 PAGES = (0, 1, 3, 4, 6, 7)
 PAGE_START = {p:(0xdc00 if p==7 else 0xc000) for p in PAGES}
 
@@ -304,8 +306,17 @@ def course_maps(course):
     for pose in range(POSES):
         step = pose/SUBSTEPS
         road(pic, step, course, MARGIN)
-        maps.append([encode(b"".join(line[x:x+8] for line in pic[y:y+8]))
-                     for y in range(TOP,DASH,8) for x in range(0,8*MAP_WIDTH,8)])
+        base = []
+        bands = geometry(pose,course)
+        for y in range(TOP,DASH,8):
+            band = (y-TOP)//8
+            use_stamp = band>=FIRST_BAND and bands[band-FIRST_BAND].use_stamp
+            for x in range(0,8*MAP_WIDTH,8):
+                cell = b"".join(line[x:x+8] for line in pic[y:y+8])
+                if use_stamp:
+                    cell = cell.replace(bytes([KERB]),bytes([ASPHALT]))
+                base.append(encode(cell))
+        maps.append(base)
         rows = projection(step,course)[1]
         depths.append(bytes(64 if r is None else int(r.z*TRAVEL_PER_STEP)%PHASES for r in rows))
         scales.append(bytes(round(15*TYRES/r.z) if r else 0 for r in rows[4::8]))
@@ -315,6 +326,21 @@ def course_maps(course):
 # White on bright black / red on normal blue. A bitmap bit marks the
 # same kerb pixel on both screens.
 KERB_ATTRS = bytes((0x47, 0x0a))
+ROAD_TILE = encode(bytes([ASPHALT])*64)
+SOLID_KERB = encode(bytes([KERB])*64)
+
+
+def kerb_tile(bits):
+    if not any(bits):
+        return ROAD_TILE
+    if bits==bytes([255])*8:
+        return SOLID_KERB
+    return KERB_ATTRS+bits
+
+
+def stamp_tiles():
+    return [kerb_tile(bits) for slope in SLOPES for width in WIDTHS for phase in (0,2,4,6)
+            for bits in masks(slope,width,phase)]
 
 
 def tile_features(tile):
@@ -329,10 +355,14 @@ def tile_features(tile):
     return bits | (borders << 64) | ((occupied * 0x01010101) << 128)
 
 
-def tile_atlas(strips):
+def tile_atlas(strips, stamps=()):
     # Keep both attributes exact. Spend the remaining tile IDs on common
     # bitmaps, then match rarer edge shapes by their eight scanline masks.
     counts = Counter(t for row in strips for t in row)
+    if stamps:
+        # Include even the shapes seen only at the limits of steering.
+        counts.update({t:6*n for t,n in Counter(stamps).items()})
+        counts[ROAD_TILE] += sum(counts.values())
     groups = {}
     for t,_ in counts.most_common():
         groups.setdefault(t[:2],[]).append(t)
@@ -389,9 +419,13 @@ def artwork(course):
     half = len(maps[0])//2
     ids = [bytearray() for _ in maps]
     atlases = []
+    stamps = stamp_tiles()
     for n in range(2):
         strips = [m[n*half:(n+1)*half] for m in maps]
-        atlas,mapping = tile_atlas(strips)
+        atlas,mapping = tile_atlas(strips,stamps if n else ())
+        if n:
+            assert atlas[0]==ROAD_TILE
+            stamp_ids = bytes(mapping[t] for t in stamps)
         atlases.append(atlas)
         for dst,strip in zip(ids,strips):
             dst.extend(mapping[t] for t in strip)
@@ -419,17 +453,33 @@ def artwork(course):
                 previous = bytearray(b if b in close[a] else a for a,b in zip(row,previous))
                 if lap:
                     m[begin:begin+half] = previous
-    return ids,depths,scales,atlases
+    return ids,depths,scales,atlases,stamp_ids
+
+
+def roadside(strip):
+    # The high bit of the column ends each row. Native code can pop a
+    # column/tile pair directly from the course bank while the IRQ is masked.
+    data = bytearray()
+    for start in range(0,len(strip),MAP_WIDTH):
+        cells = [(x,t) for x,t in enumerate(strip[start:start+MAP_WIDTH]) if t]
+        for i,(x,tile) in enumerate(cells or [(63,0)]):
+            data.extend((x | (128 if i+1>=len(cells) else 0),tile))
+    return data
 
 
 def generate(out: Path, course):
-    ids,depths,scales,atlases = artwork(course)
+    ids,depths,scales,atlases,stamp_ids = artwork(course)
     half = len(ids[0])//2
     for n,atlas in enumerate(atlases):
         (out/f"atlas{n}.bin").write_bytes(b"".join(atlas))
-    shown = bytes(ids[0][row*MAP_WIDTH+MARGIN//8+x] for row in range(16) for x in range(32))
+    (out/"stamps.bin").write_bytes(stamp_data(stamp_ids))
+    (out/"edge-math.bin").write_bytes(math_data())
+    (out/"geometry.bin").write_bytes(geometry_data(0,course))
+    (out/"roadside.bin").write_bytes(roadside(ids[0][half:]))
+    shown = bytearray(ids[0][row*MAP_WIDTH+MARGIN//8+x] for row in range(16) for x in range(32))
+    shown[256:] = overlay_kerbs(shown[256:],0,128,course,stamp_ids)
     (out/"shown.bin").write_bytes(shown)
-    (out/"world.bin").write_bytes(ids[0])
+    (out/"world.bin").write_bytes(ids[0][:half])
     initial = tiles(scenery(course))
     initial[TOP*4:DASH*4] = [atlases[i//256][tile] for i,tile in enumerate(shown)]
     for bank in range(2):
@@ -439,27 +489,26 @@ def generate(out: Path, course):
     (out/"riders.bin").write_bytes(riders())
     # Keep both halves of each quarter-step together in a pageable bank.
     pages = [bytearray() for _ in PAGES]
+    limits = [STAMP_ADDR if p==7 else 0x10000 for p in PAGES]
     descriptor = []
     for q in range(POSES):
         d = depths[q]
-        halves = []
-        for n in range(2):
-            begin = n*half
-            segment = d[n*64:n*64+64]
-            halves.append(map_delta(ids[q-1][begin:begin+half],ids[q][begin:begin+half])
-                          +segment+scales[q][n*8:n*8+8])
-        route = pack("<H",len(halves[0]))+b"".join(halves)
-        index = min(range(len(pages)),key=lambda i:PAGE_START[PAGES[i]]+len(pages[i]))
+        upper = map_delta(ids[q-1][:half],ids[q][:half])+d[:64]+scales[q][:8]
+        lower = d[64:]+scales[q][8:]+geometry_data(q,course)+roadside(ids[q][half:])
+        route = pack("<H",len(upper))+upper+lower
+        index = min(range(len(pages)),key=lambda i:PAGE_START[PAGES[i]]+len(pages[i])-limits[i])
         page = pages[index]
         descriptor.append(f"    dw {PAGE_START[PAGES[index]]+len(page)}\n    db {16+PAGES[index]}, "
                           f"{drift(q//SUBSTEPS,course)*(1 if q%2 else 2) & 255}")
         page.extend(route)
-        if PAGE_START[PAGES[index]]+len(page)>0x10000:
+        if PAGE_START[PAGES[index]]+len(page)>limits[index]:
             raise ValueError(f"{course} course exceeds bank {PAGES[index]} at pose {q}")
     for page,data in zip(PAGES,pages):
         (out/f"page{page}.bin").write_bytes(data)
     (out/"course.inc").write_text("\n".join(descriptor)+"\n")
     (out/"layout.inc").write_text(f"RASTER_TOP equ {TOP}\nDASH equ {DASH}\nMAP_WIDTH equ {MAP_WIDTH}\n"
+                                  f"SLOPE_TABLE equ {MATH_ADDR}\nSHIFT_TABLE equ {SHIFT_ADDR}\n"
+                                  f"GEOMETRY_BYTES equ {len(geometry_data(0,course))}\n"
                                   f"SUBSTEP_TRAVEL equ {TRAVEL_PER_STEP//SUBSTEPS}\n"
                                   f"EARLY_TILES equ {EARLY_TILES}\nEXTRA_TILES equ {EXTRA_TILES}\n")
     # One fixed-point perspective offset per band, expressed in map columns.

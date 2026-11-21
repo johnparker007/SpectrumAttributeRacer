@@ -8,6 +8,7 @@ import subprocess
 from struct import pack
 
 from course import FONT, PAGE_START, generate
+from kerbs import MATH_ADDR, STAMP_ADDR
 from route import COURSES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +52,8 @@ def build(assembler, out=BUILD, course="coast"):
 
     assemble(ROOT/"src/racer.asm")
     blocks = [(0x10, 0x8000, "core.bin"), (0x10, 0x4000, "screen0.bin"),
-              (0x17, 0xc000, "screen1.bin"), (0x10, 0x6000, "working.bin")]
+              (0x17, 0xc000, "screen1.bin"), (0x17, STAMP_ADDR, "stamps.bin"),
+              (0x10, MATH_ADDR, "edge-math.bin"), (0x10, 0x6000, "working.bin")]
     blocks += [(0x10+page, PAGE_START[page], f"page{page}.bin") for page in pages]
     (out/"blocks.inc").write_text("".join(f"    db {latch}\n    dw {addr},{(out/file).stat().st_size}\n"
                                          for latch,addr,file in blocks))

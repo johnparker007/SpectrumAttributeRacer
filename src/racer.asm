@@ -73,6 +73,12 @@ frameWait:
     halt
     di
     ld (restoreSP+1),sp
+    ; Clear the spare foreground page in the top border at a fixed cost.
+clearPage:
+    ld sp,spareLower+256 : ld hl,0
+    dup 128
+        push hl
+    edup
     ld sp,dirty
     ld hl,riderSource : ld (afterJobs+1),hl
     ld a,EARLY_TILES
@@ -266,7 +272,11 @@ nextHalf:
     ld a,(scanHalf) : xor 1 : ld (scanHalf),a
     ld e,a : ld d,0 : ld hl,resumeCol : add hl,de : ld l,(hl)
     ld h,a : ld a,high shownMap : add a,h : ld (scanShown+2),a
-    ld a,high targetMap : add a,h : ld (scanSource+2),a
+    ld a,h : or a : ld a,high targetMap : jr z,scanPage
+activeLower:
+    ld a,high (targetMap+256)
+scanPage:
+    ld (scanSource+2),a
     ld a,l : ld (scanShown+1),a : ld (scanSource+1),a
     ret
 
@@ -316,13 +326,29 @@ applyHalf:
     res 0,a : ld (pending),a
 upperPatch:
     ld hl,0
-    ld de,worldMap : ld ix,activeDepth : jr patchPage
+    ld de,worldMap : jp patchPage
 applyLower:
     ld a,(pending) : bit 1,a : ret z
     res 1,a : ld (pending),a
+    ld a,255 : ld (lastLane+1),a
 lowerPatch:
     ld hl,0
-    ld de,worldMap+8*MAP_WIDTH : ld ix,activeDepth+64
+    ld bc,#7ffd : ld a,(bankValue+1) : out (c),a
+    ld de,activeDepth+64
+    dup 64
+        ldi
+    edup
+    ld de,bandScale+8
+    dup 8
+        ldi
+    edup
+    ld de,edgeGeometry
+    dup GEOMETRY_BYTES
+        ldi
+    edup
+    ld (roadsideSource+1),hl
+    ld a,(bankValue+1) : ld (roadsideBank+1),a
+    ld a,#17 : ld bc,#7ffd : out (c),a : ret
 patchPage:
     ld bc,#7ffd
 bankValue:
@@ -334,13 +360,11 @@ patchLoop:
 .literal:
     and 127 : ld c,a : ld b,0 : ldir : jr patchLoop
 patchDepth:
-    push ix : pop de
+    ld de,activeDepth
     dup 64
         ldi
     edup
-    ld de,bandScale : ld a,(scanHalf) : or a : jr z,.scale
-    ld de,bandScale+8
-.scale:
+    ld de,bandScale
     dup 8
         ldi
     edup
@@ -379,11 +403,33 @@ viewport:
     edup
     ret
 .lower:
-    ld de,targetMap+256
-    dup 8,y
-        VIEW_BAND (y+8)
+    ld a,(lane) : and #fc
+lastLane:
+    cp 128 : ret z
+    ld (lastLane+1),a : xor a : ld (extraLimit),a
+    ld a,(clearPage+2) : dec a : ld (scanSource+2),a
+    ld (scenePage+1),a : ld (stampPage+1),a
+    ld b,a : ld a,(activeLower+1) : inc a : ld (clearPage+2),a
+    ld a,b : ld (activeLower+1),a
+    call drawKerbs
+    ld bc,#7ffd
+roadsideBank:
+    ld a,#17 : out (c),a
+    ld (scenerySP+1),sp
+roadsideSource:
+    ld sp,roadsideInitial
+scenePage:
+    ld d,high (targetMap+256)
+    dup 8,row
+        ld a,(bandScale+8+row) : rrca : rrca : ld h,a : and #c0 : ld c,a
+        ld a,(lane) : rrca : rrca : and 63 : or c : ld l,a
+        ld a,h : and 3 : add a,high scroll : ld h,a : ld c,(hl)
+1:      pop hl : ld a,l : and 63 : sub c : cp 32 : jr nc,2f
+        or row*32 : ld e,a : ld a,h : ld (de),a
+2:      bit 7,l : jr z,1b
     edup
-    ret
+scenerySP:
+    ld sp,0 : ld bc,#7ffd : ld a,#17 : out (c),a : ret
 
 updateHud:
     ; The ULA reads the dashboard from bank 5 alone.
@@ -487,6 +533,64 @@ atlasLo1:
     edup
 atlas0:     incbin "atlas0.bin"
 atlas1:     incbin "atlas1.bin"
+; Project both ends of every foreground band once. Adjacent bands use the
+; same point even on an outward drift. A unit here is two screen pixels.
+roadsideInitial: incbin "roadside.bin"
+edgeGeometry: incbin "geometry.bin"
+    assert $-edgeGeometry == GEOMETRY_BYTES
+edgeLeft: ds 9
+edgeRight: ds 9
+drawKerbs:
+    ld a,(lane) : rrca : rrca : and 63 : ld c,a
+    dup 9,i
+        ld a,(edgeGeometry+3*i) : rrca : rrca : ld h,a
+        and #c0 : or c : ld l,a
+        ld a,h : and 15 : add a,high SHIFT_TABLE : ld h,a : ld b,(hl)
+        ld hl,(edgeGeometry+3*i+1)
+        ld a,l : add a,b : ld (edgeLeft+i),a
+        ld a,h : add a,b : ld (edgeRight+i),a
+    edup
+    dup 8,row
+        ld a,(edgeGeometry+27+row) : cp 255 : jr z,1f
+        ld (stampWidth+1),a
+        ld a,32*row : ld (stampRow+1),a
+        ld hl,(edgeLeft+row) : call drawStamp
+        ld hl,(edgeRight+row) : call drawStamp
+1:
+    edup
+    ret
+drawStamp:
+    ld a,h : sub l : jr nc,.origin
+    ld l,h
+.origin:
+    ld e,a : ld d,high SLOPE_TABLE : ld a,(de) : ld h,a
+    ld a,l : ld b,a : and 3 : add a,a : add a,a : add a,a
+stampWidth:
+    or 0 : ld l,a
+    ld a,(hl) : inc l : ld c,a : and 7 : ld e,a
+    ld a,c : rrca : rrca : rrca : and 7 : ld c,a
+    ld a,b : srl a : srl a : add a,c : sub 18
+    jr nc,.right
+    ; Skip the part before x=0, including a wholly off-screen stamp.
+    neg : ld b,a : ld a,e : sub b : ret c : ret z : ld e,a
+    ld a,l : add a,b : ld l,a : xor a
+.right:
+    cp 32 : ret nc : ld c,a : add a,e : cp 33 : jr c,.write
+    ld a,32 : sub c : ld e,a
+.write:
+    ld a,7 : sub e : add a,a : ld (stampCopy+1),a : ld a,c
+stampRow:
+    add a,0 : ld e,a
+stampPage:
+    ld d,high (targetMap+256)
+stampCopy:
+    jr $
+    dup 7
+        ldi
+    edup
+    ret
+    align 256
+spareLower: ds 256
     assert $ < #bd00
     org #bfbf
 irq:
