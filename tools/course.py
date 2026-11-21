@@ -10,15 +10,16 @@ from struct import pack
 WIDTH, HEIGHT = 256, 192
 HORIZON, DASH = 64, 168
 STEPS, PHASES = 64, 32
-TOP_TILES, BOTTOM_TILES = 24, 5
+TOP_TILES, BOTTOM_TILES = 23, 6
 BATCH_TILES = TOP_TILES + BOTTOM_TILES
 PAGES = (0, 1, 3, 4, 6)
 
 # Each material specifies its colour on the two screen banks. Bit 3 is BRIGHT.
-VOID, GRASS, TEAL, KERB, PAINT, STEEL, LAMP, RUBY = range(8)
-# Grass shares BRIGHT with the white kerb and normal intensity with the red.
-MATERIALS = [(0, 0), (12, 4), (13, 13), (15, 2), (15, 0), (7, 7),
-             (14, 14), (10, 10)]
+VOID, GRASS, TEAL, KERB, PAINT, STEEL, LAMP, RUBY, ASPHALT = range(9)
+# Bank 7 uses normal intensity across the entire road, including the objects.
+# Its lane paint matches the asphalt so the dashes disappear into the blue.
+MATERIALS = [(0, 0), (12, 4), (13, 5), (15, 2), (15, 1), (7, 7),
+             (14, 6), (10, 2), (0, 1)]
 STATIC = len(MATERIALS)
 MATERIALS += [(i, i) for i in range(16)]
 
@@ -137,7 +138,7 @@ def road(pic, step):
             row[:] = bytes([GRASS]) * WIDTH
             width = kerb_width(d)
             span(row, lo, lo + width, KERB)
-            span(row, lo + width, hi, VOID)
+            span(row, lo + width, hi, ASPHALT)
             span(row, hi, hi + width, KERB)
             for side in (-1, 1):
                 mark = round(centre(step, d) + side * halfwidth(d) * 0.36)
@@ -180,7 +181,7 @@ def road(pic, step):
             if shape == "#":
                 row[x-h//2+dx] = LAMP if sy<6 else TEAL if sy<16 else STEEL
             elif shape == ".":
-                row[x-h//2+dx] = VOID
+                row[x-h//2+dx] = ASPHALT
     return x, foot
 
 
@@ -193,17 +194,17 @@ def encode(cell):
     # Both banks share a bitmap. Pick two materials for this cell, allowing the
     # bitmap edge to cross an attribute boundary at single-pixel precision.
     count = Counter(cell)
-    if KERB in count and VOID in count and len(count) > 2 and GRASS not in count:
+    if KERB in count and ASPHALT in count and len(count) > 2 and GRASS not in count:
         # A distant rider can occupy the same cell as the inner edge. Draw
         # its highlights in the kerb ink so both silhouettes survive the swap.
-        cell = bytes(VOID if m in (VOID, PAINT) else KERB for m in cell)
+        cell = bytes(ASPHALT if m in (ASPHALT, PAINT) else KERB for m in cell)
         count = Counter(cell)
     weights = {KERB: 4, PAINT: 4, STEEL: 5, LAMP: 6, RUBY: 6, TEAL: 5}
     ranked = sorted(count, key=lambda m: count[m]*weights.get(m, 1), reverse=True)
     paper, ink = ranked[0], ranked[min(1,len(ranked)-1)]
     # The rider keeps background set bits under the transparent part of its
     # mask. Keep the black asphalt clear even in a mostly painted edge cell.
-    if ink == VOID:
+    if ink in (ASPHALT, VOID):
         paper, ink = ink, paper
     attrs = []
     for page in range(2):
@@ -265,7 +266,8 @@ def riders():
         for r in range(3):
             for c in range(3):
                 colours = ((7,14,7),(10,10,10),(7,15,7))
-                out.extend((colours[r][c] & 7 | (64 if colours[r][c] >= 8 else 0),0))
+                ink = colours[r][c] & 7
+                out.extend((ink | (64 if colours[r][c] >= 8 else 0), ink))
                 for y in range(r*8,r*8+8):
                     mask, bits = 255, 0
                     for x in range(c*8,c*8+8):

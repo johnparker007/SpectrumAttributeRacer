@@ -19,6 +19,23 @@
             ld a,b : ld (hl),a : ld (de),a : inc h : inc d
         edup
     endm
+    ; Save the shared terrain bitmap and mask in the rider. On a solid dim
+    ; cell only the sprite's ink bits are visible. A two-colour dim cell
+    ; keeps its original palette and the composed edge. Both paths cost 4 T
+    ; between the bank 5 and bank 7 stores on every scanline.
+    macro RIDER_PIXELS cell, solid
+        ld h,#50 : ld d,#d0
+        dup 8, scan
+            ld a,(hl) : ld (underlay+cell*10+2+scan),a
+            pop bc : and c : or b : ld (hl),a
+            if solid
+                ld a,b
+            else
+                nop
+            endif
+            ld (de),a : inc h : inc d
+        edup
+    endm
     org #8000
 start:
     di
@@ -63,20 +80,25 @@ riderSource:
             ld h,#5a : ld d,#da
             ld a,(hl) : ld (underlay+(ry*3+rx)*10),a
             ld a,(de) : ld (underlay+(ry*3+rx)*10+1),a
-            pop bc : ld (hl),c : ld a,c : ld (de),a
-            ld h,#50 : ld d,#d0
-            dup 8, scan
-                ld a,(hl) : ld (underlay+(ry*3+rx)*10+2+scan),a
-                pop bc : and c : or b : ld (hl),a : ld (de),a
-                inc h : inc d
+            pop bc : ld (hl),c              ; bright attribute, dim sprite ink
+            ld c,a                          ; original dim attribute
+            rrca : rrca : rrca : xor c : and 7
+            jp nz,1f                        ; different ink and paper
+            ld a,c : and #38 : or b : ld (de),a
+            RIDER_PIXELS (ry*3+rx),1
+            jp 2f
+1:          dup 8                           ; match the 22 T setup + 10 T jump
+                nop
             edup
+            RIDER_PIXELS (ry*3+rx),0
+2:
         edup
     edup
 restoreSP:
     ld sp,0
 blitDone:
     ; Calibrated from IM2 entry. No video RAM or I/O access in this delay.
-    ld bc,582
+    ld bc,564
 .align:
     dec bc : ld a,b : or c : jr nz,.align
 phasePointer:
@@ -279,7 +301,7 @@ prepareTiles:
     ld (cursor),sp
     ld bc,#7ffd : ld a,#17 : out (c),a
     ; The beam has passed the road and the previous rider is restored. Apply
-    ; the last five jobs here, then the first 24 before the next active display.
+    ; the tail of the batch here, then the rest before the next active display.
     ld sp,jobs+TOP_TILES*14
     ld a,BOTTOM_TILES
 .bottomTile:

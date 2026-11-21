@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 from build import BUILD, executable
-from course import (DASH, GRASS, HORIZON, KERB, MATERIALS, PAINT, PHASES, STEPS, VOID,
+from course import (ASPHALT, DASH, GRASS, HORIZON, KERB, MATERIALS, PAINT, PHASES, STEPS,
                     bitmap_offset, centre, halfwidth, kerb_starts, riders, road, scenery,
                     screen, tiles)
 
@@ -135,13 +135,23 @@ def pixels(attr, bits):
 def verify_road_edges():
     pic = scenery()
     transitions = 0
+    dim_colours = {GRASS: 4, KERB: 2, ASPHALT: 1, PAINT: 1}
     for step in range(STEPS):
         road(pic, step)
         scene = tiles(pic)
         # A foreground rider can share an inner-edge cell near the horizon.
         # The outer grass/paint transition is checked even alongside signs.
         objects = {(y//8, x//8) for y in range(HORIZON, DASH)
-                   for x, material in enumerate(pic[y]) if material not in (VOID, GRASS, KERB, PAINT)}
+                   for x, material in enumerate(pic[y]) if material not in (ASPHALT, GRASS, KERB, PAINT)}
+        road_tiles = scene[HORIZON//8*32:DASH//8*32]
+        require(all(not (tile[1] & 64) for tile in road_tiles), f"BRIGHT set on dim band at step {step}")
+        for y in range(HORIZON, DASH):
+            for x, material in enumerate(pic[y]):
+                if (y//8, x//8) not in objects:
+                    tile = scene[y//8*32 + x//8]
+                    shift = 0 if tile[2+y%8] & (128 >> (x%8)) else 3
+                    require(((tile[1] >> shift) & 7) == dim_colours[material],
+                            f"Wrong dim terrain colour at step {step}, ({x}, {y})")
         for d in range(DASH-HORIZON):
             y = HORIZON + d
             width = round(6 + (36 - 6) * d / (DASH - HORIZON - 1))
@@ -158,7 +168,7 @@ def verify_road_edges():
                     if not 0 <= x < 256:
                         continue
                     cell = (y//8, x//8)
-                    expected = VOID
+                    expected = ASPHALT
                     if 0 < offset <= width:
                         expected = KERB
                     elif offset == width + 1:
@@ -176,18 +186,24 @@ def verify_road_edges():
     return f"{transitions} grass/kerb transitions and 6-36 pixel kerbs checked across {STEPS} poses on both screens"
 
 
-def initial_hud_and_rider(scr, step):
+def initial_hud_and_rider(scr, step, bank):
     # Idle keyboard, second gear. In the first nine poses the right-hand bend
     # displaces the rider a cell on steps 4, 6 and 8.
     col = 14 - len(range(4,step+1,2))
     sprite = riders()[162:324]
     for tile in range(9):
         row, x = divmod(tile,3)
-        scr[6144+(18+row)*32+col+x] = sprite[tile*18]
+        address = 6144+(18+row)*32+col+x
+        terrain = scr[address]
+        solid = (terrain & 7) == ((terrain >> 3) & 7)
+        if bank == 0:
+            scr[address] = sprite[tile*18]
+        elif solid:
+            scr[address] = (terrain & 0x38) | sprite[tile*18+1]
         for dy in range(8):
             offset = bitmap_offset(144+8*row+dy,col+x)
             mask,ink = sprite[tile*18+2+dy*2:tile*18+4+dy*2]
-            scr[offset] = (scr[offset] & mask) | ink
+            scr[offset] = ink if bank == 1 and solid else (scr[offset] & mask) | ink
     scr[6144+22*32+16:6144+22*32+20] = bytes((0x46,0x46,1,1))
     for x in (25,26):
         scr[6144+22*32+x] = 0x47
@@ -204,7 +220,7 @@ def reference():
         pair = []
         for bank in (0,1):
             scr = screen(scene,bank)
-            initial_hud_and_rider(scr,step)
+            initial_hud_and_rider(scr,step,bank)
             pair.append([b"".join(pixels(scr[6144+y//8*32+x],scr[bitmap_offset(y,x)])
                                   for x in range(32)) for y in range(192)])
         for phase in range(PHASES):
@@ -222,6 +238,11 @@ def video(emulator,model,folder,expected):
               ["--vofilefps","50","--frameskip","0","--disable-autoframeskip","--vofile",raw])
     require("352 X 304, bgr24" in log,f"{model} unknown realvideo format")
     seen = set()
+    # BGR24 at normal intensity. Match complete, unobstructed scanlines in
+    # real video, including lane dashes disappearing on the dim screen.
+    green, red, blue = (b"\x00\xc0\x00", b"\x00\x00\xc0", b"\xc0\x00\x00")
+    dim_row = re.compile(b"".join(b"(?:" + colour + b")+" for colour in (green, red, blue, red, green)))
+    dim_lines = set()
     previous = None
     with raw.open("rb") as frames:
         while frame := frames.read(3*WIDTH*HEIGHT):
@@ -230,12 +251,17 @@ def video(emulator,model,folder,expected):
             match = expected.get(sha256(b"".join(rows)).digest())
             if match:
                 seen.add(match)
+                for y in range(HORIZON, DASH):
+                    if y not in dim_lines and dim_row.fullmatch(rows[y]):
+                        dim_lines.add(y)
                 if previous and previous[0]==match[0]:
                     require(match[1]==(previous[1]+2)%PHASES, f"{model} unexpected stripe motion")
             previous = match
     steps,phases = {s for s,_ in seen},{p for _,p in seen}
     require(len(steps)>=4 and len(phases)>=8, f"{model} release tape pixel matches {sorted(seen)}")
-    return f"retail tape pixels matched {len(steps)} road poses and {len(phases)} raster phases"
+    require(len(dim_lines) >= 40, f"{model} five-colour-run sequence seen on only {len(dim_lines)} scanlines")
+    return (f"retail tape matched {len(steps)} road poses, {len(phases)} raster phases and the full "
+            f"dim green/red/blue/red/green sequence on {len(dim_lines)} scanlines")
 
 
 def main():
