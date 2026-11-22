@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import re
 import subprocess
 from struct import pack
 
@@ -51,7 +52,12 @@ def build(assembler, out=BUILD, course="coast"):
                        cwd=out, check=True)
 
     assemble(ROOT/"src/racer.asm")
-    blocks = [(0x10, 0x8000, "core.bin"), (0x10, 0x4000, "screen0.bin"),
+    variables = {k:int(v,16) for k,v in re.findall(r"^(\S+): EQU 0x([0-9a-fA-F]+)$", (out/"racer.sym").read_text(), re.M)}
+    names = ("motionOld","motionNext","motionHaveOld","motionCount","motionForce","motionPending","inFlight","occupied","previousMap","packets")
+    (out/"motion-symbols.inc").write_text("".join(f"{k} equ {variables[k]}\n" for k in names))
+    assert SHAPE_BASE + (out/"shapes.bin").stat().st_size <= 0xfa00
+    assemble(ROOT/"src/motion.asm")
+    blocks = [(0x16,0xfa00,"motion.bin"), (0x10, 0x8000, "core.bin"), (0x10, 0x4000, "screen0.bin"),
               (0x17, 0xc000, "screen1.bin")]
     blocks += [(0x10,0xc000,"glyphs.bin"), (0x16,SHAPE_BASE,"shapes.bin"), (0x11,0xfc00,"descriptors.bin"), (0x16,0xfe00,"fine-slope.bin"),
                (0x17,0xdb00,"copy7.bin"), (0x10,0x7100,"copy5high.bin")]

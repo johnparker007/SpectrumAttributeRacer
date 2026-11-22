@@ -83,7 +83,7 @@ def paper_frames(raw,height):
 
 
 @lru_cache(maxsize=384)
-def picture(course,pose,lane,lean):
+def scene_pixels(course,pose,lane,lean):
     """Project intervals directly, independently of the Z80's glyph atlas."""
     first,points=bands(pose,course)
     bits=[0]*LINES
@@ -120,16 +120,73 @@ def picture(course,pose,lane,lean):
         for k in range(8):
             mask,ink=art[cell*18+2+2*k:cell*18+4+2*k]
             bits[y0+k]=(bits[y0+k]&~((mask^255)<<(248-8*col)))|(ink<<(248-8*col))
-    pair=[[],[]]
-    for y,row in enumerate(bits):
-        attrs=styles[(y//8)*32:(y//8+1)*32]
-        for b in (0,1):
-            pair[b].append(b''.join(pixels(ATTRS[st][b],v) for st,v in zip(attrs,row.to_bytes(32,'big'))))
+    return bits, styles
+
+
+def foreground_boundaries(course, pose, lane):
+    """The six edges of the visible paint at each of the five foreground knots."""
+    crest, points = bands(pose, course)
+    result = []
+    for y in range(136, 169, 8):
+        point = points[(y-FIRST)//8-crest//8]
+        left, right, centre, width = projected(point, lane)
+        left, right, centre = (2*(x-64) for x in (left, right, centre))
+        result.append((left, left+width, right, right+width, centre, centre+2))
+    return result
+
+
+def apply_foreground_midpoint(course, pose, lane, next_pose, next_lane, bits, styles):
+    old = foreground_boundaries(course, pose, lane)
+    target = foreground_boundaries(course, next_pose, next_lane)
+    middle = [old[0]] + [tuple((a+b)//2 for a,b in zip(start,end))
+                         for start,end in zip(old[1:],target[1:])]
+    planes = [bits.copy(), bits.copy()]
+
+    def paint_span(left, right):
+        # The native patch clips its two boundary coordinates to byte range.
+        left, right = (min(255, max(0, v)) for v in (left, right))
+        return ((1 << (right-left)) - 1) << (256-right)
+
+    for band in range(4):
+        y0 = 136+band*8
+        cells = styles[(y0-FIRST)//8*32:(y0-FIRST)//8*32+32]
+        for side in range(3):
+            centre = side == 2
+            allowed = (0,2) if centre else (0,1)
+            mask = int.from_bytes(bytes(255 if style in allowed and
+                                        (y0 < 144 or not 14 <= col <= 16) else 0
+                                        for col,style in enumerate(cells)), 'big')
+            for dy in range(8):
+                spans = []
+                for shape in (old, middle):
+                    top = shape[band][2*side:2*side+2]
+                    bottom = shape[band+1][2*side:2*side+2]
+                    left, right = ((a*(8-dy)+b*dy+4)//8 for a,b in zip(top,bottom))
+                    spans.append(paint_span(left,right))
+                change = (spans[0] ^ spans[1]) & mask
+                y = y0+dy-FIRST
+                planes[0][y] ^= change
+                if not centre:
+                    planes[1][y] ^= change
+    return planes
+
+
+@lru_cache(maxsize=384)
+def picture(course, pose, lane, lean, next_pose=None, next_lane=None):
+    bits, styles = scene_pixels(course,pose,lane,lean)
+    planes = ((bits,bits) if next_pose is None else
+              apply_foreground_midpoint(course,pose,lane,next_pose,next_lane,bits,styles))
+    pair = [[],[]]
+    for bank, rows in enumerate(planes):
+        for y, row in enumerate(rows):
+            attrs = styles[(y//8)*32:(y//8+1)*32]
+            pair[bank].append(b''.join(pixels(ATTRS[style][bank],value)
+                                      for style,value in zip(attrs,row.to_bytes(32,'big'))))
     return pair
 
 
-def road_image(course,pose,lane,lean,phase):
-    screens=picture(course,pose,lane,lean)
+def road_image(course,pose,lane,lean,phase,next_pose=None,next_lane=None):
+    screens=picture(course,pose,lane,lean,next_pose,next_lane)
     return [screens[int(r is None or (r[2]+phase)&16!=0)][y] for y,r in enumerate(surface(pose,course))]
 
 
@@ -137,12 +194,18 @@ def symbols_for(out):
     return {k:int(v,16) for k,v in re.findall(r'^(\S+): EQU 0x([0-9A-Fa-f]+)$',
                                                (out/'racer.sym').read_text(),re.M)}
 def frame_states(events):
-    return [(v&255,(v>>8)&255,(v>>16)&3,v>>18) for k,v in events if k=="calibrated"]
+    frames = []
+    for label, value in events:
+        if label == "calibrated":
+            frames.append((value&255, (value>>8)&255, (value>>16)&3, value>>18))
+        elif label == "turnRaster" and frames and value&1:
+            frames[-1] += ((value>>8)&255, (value>>16)&255)
+    return frames
 
 
 @lru_cache(maxsize=4096)
-def frame_digest(course,pose,lane,lean,phase):
-    return sha256(b"".join(road_image(course,pose,lane,lean,phase))).digest()
+def frame_digest(course,pose,lane,lean,phase,next_pose=None,next_lane=None):
+    return sha256(b"".join(road_image(course,pose,lane,lean,phase,next_pose,next_lane))).digest()
 
 
 def compare_capture(raw,course,states):
@@ -178,6 +241,9 @@ def check_drive(emu,model,image,s,course,folder,seconds,keys=True,tape=False,ful
     state=peek("displayPose")+"+256*"+peek("displayLane")+"+65536*"+peek("displayLean")+"+262144*"+peek("phase")
     points=[("calibrated",state),("irq","TSTATESP"),("showState","TSTATESP"),
             ("rasterDone.finish","TSTATES"),("controls",peek("passes")+"+256*"+peek("gear"))]
+    if "midState" in s:
+        target = peek("midState")+"+256*"+peek("drawingPose")+"+65536*"+peek("drawingLane")
+        points.append(("turnRaster",target))
     if tape:
         points.append(("start", "PEEK(5B5CH)"))
     raw=folder/"drive.raw"
@@ -195,6 +261,8 @@ def check_drive(emu,model,image,s,course,folder,seconds,keys=True,tape=False,ful
     irqs=[v//FRAME for k,v in ev if k=="irq"][2:]
     require(all(b==a+1 for a,b in zip(irqs,irqs[1:])),f"{model} missed an interrupt")
     start,frames=compare_capture(raw,course,states)
+    if "midState" in s and (not tape or full_lap):
+        require(any(len(frame)==6 for frame in states[:frames]),f"{model} never displayed an intermediate road frame")
     poses=[k[0] for k in states[:frames]]
     changes=[q for i,q in enumerate(poses) if i==0 or poses[i-1]!=q]
     require(all(q==(p+1)%256 for p,q in zip(changes,changes[1:])),f"{model} skipped a camera position")
@@ -314,10 +382,10 @@ def main():
                     steering = folder/"burst-keys.txt"
                     steering.write_bytes(b"p oo pp oo pp " * 12)
                     print(course,model,"burst",check_timing(emu,model,peak,s,20,steering),flush=True)
-                result,_,_=check_drive(emu,model,image,s,course,folder,180)
+                result,_,_=check_drive(emu,model,image,s,course,folder,240)
                 print(course,model,result,flush=True)
                 check_controls(emu,model,image,s,folder)
-                result,_,_=check_drive(emu,model,image,s,course,folder,180,tape=True,full_lap=True)
+                result,_,_=check_drive(emu,model,image,s,course,folder,240,tape=True,full_lap=True)
                 print(course,model,"retail TAP",result,flush=True)
         with ThreadPoolExecutor(max_workers=3) as pool:
             list(pool.map(check,args.model or ("128k","P2","P2A41")))

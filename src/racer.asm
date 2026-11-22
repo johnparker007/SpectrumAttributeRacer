@@ -97,6 +97,7 @@ rasterDone:
     ld hl,(nextWords) : ld (visibleWords),hl
     call showState : ld a,1 : ld (inFlight),a : xor a : ld (ready),a : jr .finish
 .noFrame:
+    call applyMotion
     ld hl,dummyWords : ld (visibleWords),hl
     ld hl,padding : ld (topEntry),hl : ld hl,packets : ld (topEnd),hl
 .finish:
@@ -118,6 +119,41 @@ packetRestore:
     ld hl,0 : ld (hl),b : dec hl : ld (hl),c
 packetSP:
     ld sp,0 : ret
+
+
+; Apply a prepared subframe while the ULA is below the road. Packets contain
+; a screen address and an XOR mask. Bit 7 of the address selects centre paint,
+; which is visible only in the bright bank. Kerbs use both screen pages.
+applyMotion:
+    ld a,(motionPending) : or a : ret z
+    ld (motionStack+1),sp : ld sp,packets
+    ld a,(motionCount) : dec a : ld c,a : srl a : srl a : inc a : ld b,a
+    ld a,c : cpl : and 3 : add a,a : ld e,a : ld d,0
+    ld hl,motionEntries : add hl,de : ld a,(hl) : inc hl : ld h,(hl) : ld l,a : jp (hl)
+motionEntries:
+    dw motionGroup,motionTwo,motionThree,motionFour
+    macro MOTION_BYTE
+        ; Pop a word and a byte. The following entry shares the spare byte.
+        pop hl : pop de : dec sp
+        ld a,h : xor #80 : ld c,a : res 7,h
+        ld a,(hl) : xor e : ld (hl),a : ld h,c : ld (hl),a
+    endm
+motionGroup: MOTION_BYTE
+motionTwo:   MOTION_BYTE
+motionThree: MOTION_BYTE
+motionFour:  MOTION_BYTE
+    djnz motionGroup
+motionStack:
+    ld sp,0
+    xor a : ld (motionPending),a : inc a : ld (midState),a : ret
+
+; Fetch and consume the forced halves for a 16x8 pair. Their final image
+; can equal the original even when the intervening XOR changed the screen.
+motionHalfMask:
+    sub 176 : jr nc,.foreground : xor a : ret
+.foreground:
+    add a,low motionForce : ld l,a : ld h,high motionForce
+    ld a,(hl) : ld (hl),0 : or a : ret
 
 calibrate:
     ld hl,calibrated : ld (syncJump+1),hl
@@ -143,6 +179,7 @@ endCalibration:
     ld sp,(returnSP+1) : ei : jp frameWait
 
 showState:
+    xor a : ld (midState),a
     ld hl,(drawingDepth) : ld de,(visibleDepth)
     ld (visibleDepth),hl : ld (drawingDepth),de
     ld a,(drawingPose) : ld (displayPose),a
@@ -183,46 +220,53 @@ prepare:
     ld a,#16 : ld (selectedBank),a : ld bc,#7ffd : out (c),a
     ld a,(lean) : ld (drawingLean),a
     ld a,(displayLane) : ld b,a : ld a,(lane) : sub b : jr c,.negative
-    cp 7 : jr c,.shift : ld a,6 : jr .shift
-.negative: cp 250 : jr nc,.shift : ld a,250
+    cp 4 : jr c,.shift : ld a,3 : jr .shift
+.negative: cp 253 : jr nc,.shift : ld a,253
 .shift: add a,b : ld (drawingLane),a
-    ld a,(drawingLane) : ld l,a : ld h,0 : add hl,hl : ld de,#fe00 : add hl,de
-    ld e,(hl) : inc hl : ld d,(hl) : ld hl,128 : ld bc,halfShifts
-    dup 116,scale
-        ld a,h
-        if scale<34
-            inc a : and #fe
-        endif
-        ld (bc),a : inc c : add hl,de
+    ; Projection and scenery both use 128 + scale * steering. Keep all 113
+    ; products in one little-endian table. The cell palette grid is applied
+    ; only when the product is consumed.
+.cachedLane:
+    cp 0 : jp z,.depthSetup : ld (.cachedLane+1),a
+    ld l,a : ld h,0 : add hl,hl : ld de,#fe00 : add hl,de
+    ld e,(hl) : inc hl : ld d,(hl) : ld hl,128
+    dup 113,scale
+        ld (roadShift+scale*2),hl
+        add hl,de
     edup
-    ; The two halves of this page hold integer and fractional steering offsets
-    ; in two-pixel units. Round only after adding each endpoint residue.
-    xor a : sub e : ld e,a : ld a,0 : sbc a,d : ld d,a
-    ld hl,256 : ld bc,roadShift
-.shiftTable:
-    ld a,h : ld (bc),a : set 7,c : ld a,l : ld (bc),a : res 7,c
-    add hl,de : inc c : ld a,c : cp 34 : jr nz,.scaleReady
-    push de : ld de,-128 : add hl,de : pop de
-.scaleReady:
-    cp 113 : jr nz,.shiftTable
+.depthSetup:
     ld hl,sceneData+3 : ld de,(drawingDepth) : ld a,(sceneData) : ld b,a : ld a,64
 .sky: ld (de),a : inc de : djnz .sky
-    ld iy,(drawingDepth) : ld de,LINES-1 : add iy,de
-    ld a,(sceneData) : ld c,a : ld a,LINES : sub c : ld b,a
-    xor a : ld (nybbleFlag),a : ld c,a
-.depth:
-    call nybble : cp 15 : jr z,.absolute
-    add a,c : and 31 : jr .value
-.absolute:
-    call nybble : rlca : rlca : rlca : rlca : ld e,a : call nybble : or e
-.value: ld c,a : ld (iy),a : dec iy : djnz .depth
+    ld hl,(drawingDepth) : ld de,LINES-1 : add hl,de : ex de,hl
+    ld hl,sceneData+3
+    ld a,(sceneData) : ld c,a : ld a,LINES : sub c : ld b,a : ld c,0
+    ; Each nibble is either a delta or an escape followed by an absolute
+    ; phase. An escape consumes three nibbles, so either case changes parity.
+.high:
+    ld a,(hl) : rrca : rrca : rrca : rrca : and 15 : cp 15 : jr z,.highEscape
+    add a,c : and 31
+.highWrite:
+    ld c,a : ld (de),a : dec de : djnz .low : jr .depthDone
+.highEscape:
+    ld a,(hl) : and 1 : rrca : rrca : rrca : rrca : ld c,a : inc hl
+    ld a,(hl) : rrca : rrca : rrca : rrca : and 15 : or c : jr .highWrite
+.low:
+    ld a,(hl) : inc hl : and 15 : cp 15 : jr z,.lowEscape
+    add a,c : and 31
+.lowWrite:
+    ld c,a : ld (de),a : dec de : djnz .high : jr .depthDone
+.lowEscape:
+    ld a,(hl) : inc hl : and 31 : jr .lowWrite
+.depthDone:
     ld a,(sceneData+2) : ld l,a : ld h,0 : ld de,sceneData+3 : add hl,de
     push hl : ld a,(sceneData) : and #f8 : rrca : rrca : ld l,a : ld h,0
     ld de,bandMeta : add hl,de : push hl : pop iy : pop hl
     ld a,(sceneData+1) : inc a : ld b,a : ld ix,projected
 .project:
-    ld a,(iy) : ld (ix),a : and 127 : ld e,a : ld d,high roadShift
-    ld a,(de) : ld c,a : set 7,e : ld a,(de) : ld e,a
+    ld a,(iy) : ld (ix),a : add a,a : ld e,a : ld d,high roadShift
+    ld a,(de) : ld c,a : inc e : ld a,(de) : ld e,a
+    ld a,(ix) : cpl : and 128 : sub c : ld c,a
+    ld a,1 : sbc a,e : ld e,c : ld c,a
     ld d,(hl) : inc hl
     dup 3,i
         ld a,d : and #c0 : add a,e : ld a,(hl) : adc a,c : ld (ix+i+1),a
@@ -234,6 +278,7 @@ prepare:
     ld a,(iy+1) : ld (ix+4),a : inc iy : inc iy : ld de,5 : add ix,de
     djnz .project
     ld (objectsPtr+2),hl
+    call #fa00
     ld hl,(poolBase) : ld de,(poolSpare) : ld (poolSpare),hl : ld (poolBase),de : ld (poolNext),de
     ld hl,overlays : ld (overlayEnd),hl
     ld a,#16 : ld (selectedBank),a : ld bc,#7ffd : out (c),a
@@ -256,11 +301,6 @@ objectsPtr:
     call changes
     ld a,#17 : ld (selectedBank),a : ld bc,#7ffd : out (c),a : ret
 
-nybble:
-    ld a,(nybbleFlag) : xor 1 : ld (nybbleFlag),a : ld a,(hl) : jr z,.low
-    rrca : rrca : rrca : rrca : and 15 : ret
-.low: inc hl : and 15 : ret
-
 mapRow:
     ld l,a : add a,a : ld (bandPairs+1),a : ld h,0 : add hl,hl : add hl,hl : add hl,hl
     ld de,targetMap : add hl,de : ld (stripRow+1),hl : ret
@@ -282,14 +322,27 @@ lookupBase:
     push hl : ld a,c : srl a : ld e,a : ld a,c : add a,b : dec a : srl a : sub e : inc a : ld d,a
 bandPairs:
     ld a,0 : or e : ld l,a : ld h,high occupied
-.mark: set 1,(hl) : inc l : dec d : jr nz,bandPairs.mark
-    pop de : ld hl,(stripRow+1) : ld a,c : add a,a : add a,l : ld l,a
-.write: ld a,(de) : inc de : ld c,a : ld a,(de) : inc de : or a : jr z,.empty
-    inc l : bit 7,(hl) : jr nz,.overlap : ld (hl),a : dec l : ld (hl),c : inc l : jr .advance
-.overlap: push bc : push de : push hl : dec l : ld d,a : ld e,c : call appendOverlay
-    pop hl : pop de : pop bc : jr .advance
-.empty: inc l
-.advance: inc l : djnz .write : ret
+    ; New occupancy is bit 1. If none of these pairs has been touched by
+    ; an earlier ribbon, even the transparent tile slots can be streamed.
+    xor a
+.mark: or (hl) : set 1,(hl) : inc l : dec d : jr nz,.mark
+    bit 1,a : jr nz,.mixed
+    pop hl : ld de,(stripRow+1) : ld a,c : add a,a : add a,e : ld e,a
+    ld a,b : add a,a : ld c,a : ld b,0 : ldir : ret
+.mixed:
+    pop hl : ld de,(stripRow+1) : ld a,c : add a,a : add a,e : ld e,a
+    ld a,b : add a,a : ld c,a : ld b,0
+.tile:
+    inc e : ld a,(de) : dec e : or a : jr nz,.occupied
+    ldi : ldi : jp pe,.tile : ret
+.occupied:
+    inc hl : ld a,(hl) : dec hl : or a : jr z,.skip
+    push bc : push hl : push de
+    ld c,(hl) : inc hl : ld b,(hl) : ex de,hl : ld e,c : ld d,b
+    call appendOverlay
+    pop de : pop hl : pop bc
+.skip:
+    inc e : inc e : inc hl : inc hl : dec c : dec c : jr nz,.tile : ret
 lookupBase.clip:
     ld e,(hl) : inc hl : ld d,(hl) : inc hl
     ld a,c : cp 32 : jr nc,stripRow.skip : ld a,d : or a : jr z,stripRow.skip
@@ -352,7 +405,10 @@ trimCount:
 drawProps:
     ld a,(ix) : inc ix : or a : ret z : ld (objectCount),a
 .object:
-    ld e,(ix) : ld d,high halfShifts : ld a,(de) : add a,2 : sra a : sra a : ld (objectShift+1),a
+    ld a,(ix) : add a,a : inc a : ld e,a : ld d,high roadShift : ld a,(de)
+    ld c,a : ld a,(ix) : cp 34 : ld a,c : jr nc,.rounded : inc a : and #fe
+.rounded:
+    add a,2 : sra a : sra a : ld (objectShift+1),a
     ld b,(ix+1) : inc ix : inc ix : inc b : dec b : jr z,objectShift.end
 .tile: ld a,(ix+1)
 objectShift: sub 0 : cp 32 : jr nc,.skip
@@ -369,8 +425,16 @@ drawRider:
     ld de,162 : add iy,de : dec a : jr z,.source : add iy,de
 .source:
     dup 3,ry
+        ld hl,occupied+16*((144-FIRST)/8+ry)+7 : set 1,(hl) : inc l : set 1,(hl)
+    edup
+    dup 3,ry
         dup 3,rx
-            ld hl,targetMap+2*(((144-FIRST)/8+ry)*32+14+rx)
+            ; An empty cell has a precomposited rider glyph in this lean.
+            ld hl,(targetMap+2*(((144-FIRST)/8+ry)*32+14+rx))
+            ld a,h : or a : jr nz,1f
+            ld l,(iy) : ld h,(iy+1)
+            ld (targetMap+2*(((144-FIRST)/8+ry)*32+14+rx)),hl : jr 2f
+1:          ld hl,targetMap+2*(((144-FIRST)/8+ry)*32+14+rx)
             if ry==0 && rx==1
                 ld a,3
             else
@@ -380,16 +444,17 @@ drawRider:
                     ld a,5
                 endif
             endif
-            push hl : push af : call touch : pop af : pop hl : call writable
+            call writable
             dup 8,dy
                 ld a,(hl) : and (iy+2+dy*2) : or (iy+3+dy*2) : ld (hl),a : inc l
             edup
-            ld de,18 : add iy,de
+2:          ld de,18 : add iy,de
         edup
     edup
     ret
 
 changes:
+    ld a,(motionPending) : or a : jr nz,changes
     ld a,(inFlight) : or a : jr nz,changes
     ld hl,packets : ld (packetEnd),hl : ld hl,attrJobs : ld (attrEnd),hl
     ld hl,occupied : ld de,activeList : ld b,15
@@ -400,26 +465,41 @@ changes:
 1:      inc l
     edup
     dec b : jp nz,.scan
-    ld (activeEnd),de : ld hl,activeList : ld (activeRead+1),hl
+    ld a,e : ld (activeLimit+1),a
+    ld hl,activeList
 nextPair:
-activeRead:
-    ld hl,activeList : ld de,(activeEnd) : or a : sbc hl,de : jp z,activeDone
-    add hl,de : ld c,(hl) : inc hl : ld (activeRead+1),hl
-    ld l,c : ld h,0 : add hl,hl : add hl,hl
-    ld de,targetMap : add hl,de : push hl : pop ix
-    ld de,previousMap-targetMap : add hl,de : push hl : pop iy
-    ld a,(ix) : cp (iy) : jr nz,.change
-    ld a,(ix+1) : cp (iy+1) : jr nz,.change
-    ld a,(ix+2) : cp (iy+2) : jr nz,.change
-    ld a,(ix+3) : cp (iy+3) : jp z,.next
-.change:
-    ld a,c : ld (blockNumber),a : ld l,a : ld h,0 : add hl,hl
-    ld de,#5800+FIRST*4 : add hl,de : ld (attrAddress),hl
-    ld l,c : ld h,0 : add hl,hl : add hl,hl : add hl,hl : add hl,hl
-    ld de,stageBits : add hl,de : ld (stagePointer),hl
-    xor a : ld (dirtyHalves),a : call stageCell
-    inc ix : inc ix : inc iy : inc iy : ld hl,attrAddress : inc (hl)
-    ld hl,stagePointer : inc (hl) : call stageCell : dec ix : dec ix
+    ld a,l
+activeLimit:
+    cp 0 : jp z,activeDone
+    ld a,(hl) : inc l : push hl
+    ld (blockNumber),a : ld c,a : call motionHalfMask : ld (dirtyHalves),a
+    ld a,c : ld l,a : ld h,0 : add hl,hl : add hl,hl
+    ld de,targetMap : add hl,de : ld d,h : ld e,l
+    ld bc,previousMap-targetMap : add hl,bc
+    ; Most stable foreground pairs have identical glyph references on the
+    ; two maps. Writable glyphs alternate pools on every prepared scene.
+    jr nz,.change
+    ld a,(de) : cp (hl) : jr nz,.change
+    inc e : inc l : ld a,(de) : cp (hl) : jr nz,.back1
+    inc e : inc l : ld a,(de) : cp (hl) : jr nz,.back2
+    inc e : inc l : ld a,(de) : cp (hl) : jr nz,.back3
+    xor a : ld (de),a : dec e : ld (de),a : dec e : ld (de),a : dec e : ld (de),a
+    pop hl : jp nextPair
+.back3: dec e : dec l
+.back2: dec e : dec l
+.back1: dec e : dec l
+.change: ld a,(blockNumber)
+    ; DE and HL walk the two adjacent cells together. The secondary set
+    ; carries the row of prepared pixel bytes and its attribute address.
+    exx
+    ld l,a : ld h,0 : add hl,hl
+    ld de,#5800+FIRST*4 : add hl,de : ld b,h : ld c,l
+    ld l,a : ld h,0 : add hl,hl : add hl,hl : add hl,hl : add hl,hl
+    ld de,stageBits : add hl,de : ld d,h : ld e,l
+    exx
+    call stageCell
+    exx : inc e : inc c : exx
+    call stageCell
     ld a,(dirtyHalves) : or a : jr z,.next : ld b,a
     ld a,(blockNumber) : ld l,a : ld h,0 : add hl,hl
     ld de,writerIndex : add hl,de : ld e,(hl) : inc hl : ld d,(hl)
@@ -429,7 +509,7 @@ activeRead:
 .addr: ld (hl),e : inc hl : ld (hl),d : inc hl
 .end: ld (packetEnd),hl
 .next:
-    xor a : ld (ix),a : ld (ix+1),a : ld (ix+2),a : ld (ix+3),a : jp nextPair
+    pop hl : jp nextPair
 activeDone:
     ; Stage the overflow in scanline order. The first 64 road scanlines
     ; can copy four-line blocks farther down the screen before the ULA
@@ -460,30 +540,61 @@ activeDone:
     pop hl : ld a,(burstCount) : dec a : ld (burstCount),a : jp nz,.build : ret
 
 stageCell:
-    ld l,(ix) : ld h,(ix+1) : ld a,(iy) : cp l : jr nz,.change
-    ld a,(iy+1) : cp h : jr nz,.change : or a : ret z : cp #c0 : ret nc
-.change:
-    ld a,(iy) : ld (iy),l : ld (iy+1),h : and 7 : ld b,a
-    ld a,l : and 7 : cp b : jr z,.pixels
-    ld c,a : or b : cp 2 : jr c,.pixels
-    push hl : ld l,c : ld h,high attr0 : ld c,(hl) : inc h : ld b,(hl)
-    ld de,(attrAddress) : ld hl,(attrEnd) : ld (hl),e : inc hl : ld (hl),d : inc hl
-    ld (hl),c : inc hl : ld (hl),b : inc hl : ld (attrEnd),hl : pop hl
+    ld a,(de) : ld c,a : xor (hl) : ld b,a : ld (hl),c : xor a : ld (de),a
+    inc l : inc e
+    ld a,(de) : cp (hl) : ld (hl),a : jr nz,.changed
+    ld a,b : or a : jr nz,.changed
+    ld (de),a : inc l : inc e : ret
+.changed:
+    ld a,b : and 7 : jr z,.pixels
+    xor c : or c : and 6 : jr z,.pixels
+    push hl : ld a,c : and 7 : ld l,a : ld h,high attr0
+    ld a,(hl) : inc h : ld h,(hl) : ld l,a : push hl
+    exx
+    pop hl : push de : ld de,(attrEnd) : ex de,hl
+    ld (hl),c : inc hl : ld (hl),b : inc hl : ld (hl),e : inc hl : ld (hl),d : inc hl
+    ld (attrEnd),hl : pop de
+    exx : pop hl
 .pixels:
-    ld a,l : and #f8 : ld l,a : ld a,h : or a : jr nz,.source : ld hl,blank
+    ld a,(de) : push hl : ld h,a : ld a,c : and #f8 : ld l,a
+    ld a,h : or a : jr nz,.source : ld hl,blank
 .source:
-    ld de,(stagePointer)
-    dup 2,half
-        ld b,0
-        dup 4
-            ld a,(de) : xor (hl) : or b : ld b,a
-            ld a,(hl) : ld (de),a : inc l : inc e : inc e
-        edup
-        ld a,b : or a : jr z,1f
-        ld a,(dirtyHalves) : or 1<<half : ld (dirtyHalves),a
-1:
-    edup
-    ret
+    push hl : exx : pop hl : push de : push bc
+    ld c,0
+    ld a,(de) : cp (hl) : jr nz,.copy00
+    inc l : inc e : inc e
+    ld a,(de) : cp (hl) : jr nz,.copy01
+    inc l : inc e : inc e
+    ld a,(de) : cp (hl) : jr nz,.copy02
+    inc l : inc e : inc e
+    ld a,(de) : cp (hl) : jr nz,.copy03
+    inc l : inc e : inc e
+    jr .done0
+.copy00: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+.copy01: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+.copy02: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+.copy03: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+    set 0,c
+.done0:
+    ld a,(de) : cp (hl) : jr nz,.copy10
+    inc l : inc e : inc e
+    ld a,(de) : cp (hl) : jr nz,.copy11
+    inc l : inc e : inc e
+    ld a,(de) : cp (hl) : jr nz,.copy12
+    inc l : inc e : inc e
+    ld a,(de) : cp (hl) : jr nz,.copy13
+    inc l : inc e : inc e
+    jr .done1
+.copy10: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+.copy11: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+.copy12: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+.copy13: ld a,(hl) : ld (de),a : inc l : inc e : inc e
+    set 1,c
+.done1:
+    ld a,(dirtyHalves) : or c : ld (dirtyHalves),a
+    pop bc : pop de : exx : pop hl
+.next:
+    xor a : ld (de),a : inc l : inc e : ret
 
 publishAttrs:
     ld hl,(attrEnd) : ld de,attrJobs : or a : sbc hl,de : ret z
@@ -646,19 +757,46 @@ renderY: db 0
 depthA: ds LINES,64
 depthB: ds LINES,64
 
-riderArt: incbin "riders.bin"
+riderArt:
+    dup 27,tile
+        if tile%9==1
+            dw (riderGlyphs+tile*8)|3
+        else
+            if tile%9>=3 && tile%9<6
+                dw (riderGlyphs+tile*8)|6
+            else
+                dw (riderGlyphs+tile*8)|5
+            endif
+        endif
+        incbin "riders.bin",tile*18+2,16
+    edup
 bandMeta: incbin "band-meta.bin"
 digits: incbin "digits.bin"
 
 
 
     align 256
-halfShifts: ds 128
-    align 256
 roadShift: ds 256
 attr0: incbin "attr0.bin"
+    align 8
+riderGlyphs:
+    dup 27,tile
+        dup 8,y
+            db {b riderArt+tile*18+3+2*y}
+        edup
+    edup
+    assert $ <= attr0+256
     align 256
 attr1: incbin "attr1.bin"
+motionOld: ds 30
+motionNext: ds 30
+motionHaveOld: db 0
+motionPending: db 0
+motionCount: db 0
+midState: db 0
+motionForce: ds 64
+    assert (low motionForce)+64 <= 256
+
     align 256
 portColours:
     dup 64,i
