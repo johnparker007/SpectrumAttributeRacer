@@ -8,7 +8,9 @@ loader:
 .block:
     ld a,(hl) : inc hl
     cp #ff : jp z,#8000
-    ld bc,#7ffd : out (c),a : ld (23388),a
+    ; The loader owns the paging latch until the game takes over. BASIC's
+    ; BANKM byte at #5b5c becomes an instruction in the bank 5 bitmap writer.
+    ld bc,#7ffd : out (c),a
     ld e,(hl) : inc hl : ld d,(hl) : inc hl
     push de : pop ix
     ld e,(hl) : inc hl : ld d,(hl) : inc hl

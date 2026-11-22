@@ -1,154 +1,138 @@
-"""Compile the foreground lane and kerb strokes used by the 128K renderer."""
+"""Project connected kerbs and lane paint for each visible scanline."""
 
 from functools import lru_cache
-from typing import NamedTuple
+from math import floor
 
-from route import TYRES, projection
+from route import DASH, TOP, projection
 
-FIRST_BAND = 8
-SLOPES = tuple(range(-56,57,4))
-WIDTHS = (2, 8, 12, 16)
-PHASES = (0, 4)
-STAMP_CELLS = 12
-SCALE = 32
-# One pointer-table page per width. Signed slope and horizontal phase select a blitter.
-STAMP_ADDR = 0xec00
-SHIFT_ADDR = 0x7100
+FIRST = 48
+LINES = DASH - FIRST
+FOREGROUND = 104
 
 
-class Point(NamedTuple):
-    left: int
-    right: int
-    scale: int
-    lane_left: int
-    lane_right: int
+def nearest(value):
+    return floor(value + 0.5)
 
 
-class Band(NamedTuple):
-    start: Point
-    end: Point
-    width: int
-    use_stamp: bool
+def bounded_lap(values, speed):
+    """Limit movement per pose in both directions round the closed circuit."""
+    def lower_envelope(sequence):
+        result = sequence * 3
+        for i in range(1, len(result)):
+            result[i] = min(result[i], result[i-1] + speed)
+        for i in range(len(result)-2, -1, -1):
+            result[i] = min(result[i], result[i+1] + speed)
+        return result[len(sequence):2*len(sequence)]
+
+    lower = lower_envelope(values)
+    negative_upper = lower_envelope([-v for v in values])
+    return [(a-b)/2 for a, b in zip(lower, negative_upper)]
 
 
-def camera_shift(lane, scale):
-    """Signed offset in four-pixel units, as used by the native lookup."""
-    return round(((lane & 252) - 128) * scale / (4*SCALE))
+@lru_cache(maxsize=2)
+def circuit_surface(course):
+    frames = []
+    for pose in range(256):
+        rows = projection(pose/4, course)[1][FIRST-TOP:]
+        centre, halfwidth = 128.0, 112.0
+        lines = []
+        for row in reversed(rows):
+            if row is not None:
+                centre += max(-3.5, min(3.5, row.x - centre))
+                halfwidth += max(-2.0, min(0.0, row.halfwidth - halfwidth))
+            phase = None if row is None else int(row.z * 56) % 32
+            lines.append([centre, halfwidth, phase])
+        frames.append(list(reversed(lines)))
+
+    for y in range(LINES):
+        for axis, limit in ((0, 4.0), (1, 1.5)):
+            filtered = bounded_lap([frame[y][axis] for frame in frames], limit)
+            for frame, value in zip(frames, filtered):
+                frame[y][axis] = value
+    return [tuple(None if phase is None else (x, w, phase) for x, w, phase in frame)
+            for frame in frames]
 
 
-def section(row):
-    return (row.x - row.halfwidth - row.kerb, row.x + row.halfwidth + 1, SCALE * TYRES / row.z,
-            row.x - .36*row.halfwidth, row.x + .36*row.halfwidth)
+def surface(pose, course):
+    return circuit_surface(course)[pose]
 
 
-@lru_cache(maxsize=None)
-def geometry(pose, course):
-    rows = projection(pose / 4, course)[1][FIRST_BAND * 8:]
-    points = [Point(*map(round, section(row))) for row in rows[::8]]
-    # The final endpoint is just below the dashboard. Extrapolate the last
-    # scanline so the bottommost eight lines use the same interpolation rule.
-    last, previous = section(rows[-1]), section(rows[-2])
-    points.append(Point(*(round(2*a-b) for a,b in zip(last, previous))))
-    bands = []
-    for i, (start, end) in enumerate(zip(points, points[1:])):
-        strip = rows[8*i:8*i+8]
-        # Preserve the original silhouette at a depth break or where both
-        # kerbs, the lane dashes and scenery crowd into a few distant cells.
-        use_stamp = (max(abs(end.left-start.left), abs(end.right-start.right)) <= 25
-                     and min(start.left, end.left) >= -16 and max(start.right, end.right) <= 272
-                     and min(row.halfwidth for row in strip) >= 20
-                     and max(a.z-b.z for a,b in zip(strip, strip[1:])) < 1)
-        width = min(WIDTHS[1:], key=lambda w: abs(w-strip[4].kerb))
-        bands.append(Band(start, end, width, use_stamp))
-    return bands
+def camera_scale(y):
+    depth = max(0, y - FIRST) / LINES
+    return min(112, nearest(112 * depth ** 1.55))
 
 
-@lru_cache(maxsize=None)
-def stroke_offsets(slope, xgrid=1, ygrid=1):
-    return tuple(xgrid*round(slope*(y//ygrid*ygrid+(ygrid-1)/2)/(8*xgrid)) for y in range(8))
+def section(frame, top, y):
+    # Extrapolate the end slope at the skyline and the tyres.
+    index = max(top, min(y, LINES-1))
+    x, width, _ = frame[index]
+    if index != y:
+        neighbour = frame[index+1] if y < index else frame[index-1]
+        distance = abs(index-y)
+        x += (x - neighbour[0]) * distance
+        width += (width - neighbour[1]) * distance
+    return x, max(3, width)
 
 
-@lru_cache(maxsize=None)
-def masks(slope, width, phase, xgrid=1, ygrid=1):
-    # Keep a common cell origin for the two paint boundaries. Width is an
-    # extent, so an 18-pixel and a 10-pixel stripe can reuse the same edge tiles.
-    start = 8 + phase - min(slope, 0)
-    lines = []
-    for offset in stroke_offsets(slope,xgrid,ygrid):
-        left = start + offset
-        lines.append(((1 << width) - 1) << (8*STAMP_CELLS-left-width))
-    return tuple(bytes((row >> (8*(STAMP_CELLS-i-1))) & 255 for row in lines) for i in range(STAMP_CELLS))
+@lru_cache(maxsize=2)
+def lap_bands(course):
+    frames = circuit_surface(course)
+    first = [next(i for i, row in enumerate(frame) if row) for frame in frames]
+    controls_by_pose = [[] for _ in frames]
+    for y in range(0, LINES+1, 8):
+        scale = camera_scale(y + FIRST)
+        # Both ends of a band share this control point with their neighbour.
+        # Its width and steering leverage stay fixed as the crest moves past.
+        exact_width = 2.25 + 19.75 * scale / 140
+        width = max(4, 2 * nearest(exact_width/2))
+        columns = [[], [], []]
+        for frame, top in zip(frames, first):
+            samples = [section(frame, top, y+dy) for dy in (-8, 0, 8)]
+            x, w = ((a + 2*b + c)/4 for a, b, c in zip(*samples))
+            for column, value in zip(columns, (x-w-exact_width, x+w+1, x)):
+                column.append(value)
+        filtered = [bounded_lap(column, 4) for column in columns]
+        painted = y + FIRST >= FOREGROUND
+        grid = 2 if painted else 4
+        for pose, values in enumerate(zip(*filtered)):
+            left, right, mark = (grid//2 * nearest(v/grid) + 64 for v in values)
+            controls_by_pose[pose].append((scale, left, right, mark, width, painted, grid))
+    return [(top, points[top//8:]) for top, points in zip(first, controls_by_pose)]
 
 
-def overlay_kerbs(view, pose, lane, course, stamp_ids):
-    result = bytearray(view)
-    for row, band in enumerate(geometry(pose, course)):
-        if not band.use_stamp:
-            continue
-        for side, width in ((3,2),(4,2),(0,band.width),(1,band.width)):
-            start, end = (round(point[side]/4) - camera_shift(lane, point.scale)
-                          for point in (band.start, band.end))
-            column, phase = divmod(min(start, end), 2)
-            index = (SLOPES.index(4*(end-start))*len(WIDTHS)*2 + WIDTHS.index(width)*2 + phase)*STAMP_CELLS
-            for i, tile in enumerate(stamp_ids[index:index+STAMP_CELLS]):
-                x = column-1+i
-                if tile and 0 <= x < 32 and not view[row*32+x]:
-                    result[row*32+x] = tile
+def bands(pose, course):
+    return lap_bands(course)[pose]
+
+
+def projected(point, lane):
+    scale, left, right, mark, width, _, grid = point
+    shift = (128 + scale * nearest((lane-128) * 128/112)) // 256
+    if grid == 4:
+        shift = (shift+1)//2 * 2
+    return left-shift, right-shift, mark-shift, width
+
+
+def ribbons(a, b, lane):
+    left, right, mark, width = projected(a, lane)
+    next_left, next_right, next_mark, next_width = projected(b, lane)
+    result = [(left, next_left, width, next_width, 1),
+              (right, next_right, width, next_width, 1)]
+    if a[5] and b[5]:
+        result.append((mark, next_mark, 2, 2, 2))
     return result
 
 
-def stamp_source(ids):
-    # Each signed-slope/phase lookup points to a short blitter. Its common
-    # path writes a whole, visible stroke. Only a stamp touching the edge of
-    # the display needs the clipped writer in fixed RAM.
-    stubs = {}
-    tables = []
-    for w in range(len(WIDTHS)):
-        table = [0]*128
-        for i,slope in enumerate(SLOPES):
-            for p in range(2):
-                index = ((i*len(WIDTHS)+w)*2+p)*STAMP_CELLS
-                tiles = ids[index:index+STAMP_CELLS]
-                if not any(tiles):
-                    continue
-                first = next(j for j,t in enumerate(tiles) if t)
-                last = max(j for j,t in enumerate(tiles) if t)+1
-                shift = min(0,slope//4)
-                # Lookup phase is relative to the starting endpoint.
-                phase = (p-shift) % 2
-                offset = (phase+shift)//2 - 1 + first - 16
-                key = (offset,bytes(tiles[first:last]))
-                code = stubs.setdefault(key,len(stubs)+1)
-                table[((slope//4)*2+phase)%128] = code
-        tables.append(table)
+@lru_cache(None)
+def masks(slope, width, next_width, phase):
+    first = min(phase, phase + 2*slope) // 8
     lines = []
-    for table in tables:
-        lines.extend("    dw "+",".join(f"stroke{x}" for x in table[i:i+8])
-                     for i in range(0,128,8))
-    lines += ["stroke0: ret"]
-    for (offset,tiles),i in stubs.items():
-        lines += [f"stroke{i}:", f"    add a,{offset & 255} : cp {33-len(tiles)} : call nc,clip{len(tiles)}",
-                  "    or c : ld e,a"]
-        for tile in tiles:
-            # Keep the four-byte layout consumed by clipStroke. An empty cell
-            # in a steep stroke may already contain paint from another strip.
-            write = "ld (de),a" if tile else "nop"
-            lines.append(f"    ld a,{tile} : {write} : inc e")
-        lines += ["    ret"]
-    return "\n".join(lines)+"\n"
-
-
-def math_data():
-    return bytes(32-camera_shift(lane,s) for s in range(34) for lane in range(0,256,4))
-
-
-def geometry_data(pose, course):
-    bands = geometry(pose, course)
-    data = bytearray()
-    for point in [band.start for band in bands] + [bands[-1].end]:
-        assert 0 <= point.scale < 34
-        data.extend((SHIFT_ADDR+64*point.scale).to_bytes(2,"little"))
-        data.extend((round(point.left/4) & 255, round(point.right/4) & 255,
-                     round(point.lane_left/4), round(point.lane_right/4)))
-    data.extend((STAMP_ADDR>>8)+WIDTHS.index(b.width) if b.use_stamp else 255 for b in bands)
-    return data
+    for y in range(8):
+        left = phase + (2*slope*y + 4)//8
+        right = phase + width + ((2*slope + next_width-width)*y + 4)//8
+        lines.append((left, right))
+    end = (max(right for _, right in lines) + 7)//8
+    tiles = []
+    for col in range(first, end):
+        tiles.append(bytes(sum(128 >> bit for bit in range(8) if left <= 8*col + bit < right)
+                           for left, right in lines))
+    return first, tuple(tiles)

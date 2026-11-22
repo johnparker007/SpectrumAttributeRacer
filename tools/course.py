@@ -1,34 +1,22 @@
-"""Compile a circuit into Spectrum screen tiles and forward-only road updates."""
+"""Build the skyline, dashboard, rider artwork and projected roadside objects."""
 
 from collections import Counter
 from functools import lru_cache
 from math import cos, sin
-from pathlib import Path
 from struct import pack
 
-from kerbs import (FIRST_BAND, SHIFT_ADDR, SLOPES, STAMP_ADDR, STAMP_CELLS, WIDTHS, PHASES as STROKE_PHASES, camera_shift, geometry, geometry_data, masks,
-                   math_data, overlay_kerbs, stamp_source, stroke_offsets)
-from route import DASH, STEPS, TOP, TYRES, at_distance, drift, profile, projection
+from kerbs import FIRST, LINES, camera_scale, nearest, surface
+from route import DASH, STEPS, TOP, TYRES, at_distance, projection
 
 WIDTH, HEIGHT = 256, 192
 PHASES = 32
 TRAVEL_PER_STEP = 56
 SUBSTEPS = 4
 POSES = STEPS * SUBSTEPS
-MARGIN = 112
-MAP_WIDTH = 32 + 2*MARGIN//8
-EARLY_TILES, EXTRA_TILES = 30, 18
-PAGES = (0, 1, 3, 4, 6, 7)
-PAGE_START = {p:(0xdc00 if p==7 else 0xc000) for p in PAGES}
-
-# Each material specifies its colour on the two screen banks. Bit 3 is BRIGHT.
-VOID, TEAL, KERB, PAINT, STEEL, LAMP, RUBY, ASPHALT = range(8)
-# Bank 7 uses normal intensity across the entire road, including the objects.
-# Its lane paint matches the asphalt so the dashes disappear into the blue.
-MATERIALS = [(0, 0), (13, 5), (15, 2), (15, 1), (7, 7),
-             (14, 6), (10, 2), (8, 1)]
-STATIC = len(MATERIALS)
-MATERIALS += [(i, i) for i in range(16)]
+# The static artwork uses the Spectrum's eight normal and eight bright colours.
+STATIC = 8
+PAGES = (1, 3, 4)
+PAGE_START = {page: 0xc000 for page in PAGES}
 
 # Compact lettering for the instrument fascia.
 FONT = dict(zip("AEGPRS0123456789",
@@ -116,109 +104,8 @@ def scenery(course="coast"):
     return pic
 
 
-@lru_cache(maxsize=2)
-def background(course):
-    return tuple(bytes(row) for row in scenery(course)[:DASH])
-
-
 def visible(rows, y, z):
     return TOP <= y < DASH and (rows[y-TOP] is None or rows[y-TOP].z >= z-.04)
-
-
-def road(pic, step, course="coast", margin=0):
-    samples, rows = projection(step, course)
-    for i, r in enumerate(rows):
-        row = pic[TOP+i]
-        if r is None:
-            sky = background(course)[TOP+i]
-            row[:] = sky[:1]*margin + sky + sky[-1:]*margin
-            continue
-        # Both sides of a kerb use the same paper. Its two edges can follow
-        # the projection independently on every scanline.
-        left = margin + round(r.x-r.halfwidth)
-        right = margin + round(r.x+r.halfwidth) + 1
-        row[:] = bytes([ASPHALT]) * len(row)
-        span(row, left-r.kerb, left, KERB)
-        span(row, right, right+r.kerb, KERB)
-        # At the horizon the two lane dividers would share ULA cells with
-        # the kerbs. Start the paint where the two lanes are distinguishable.
-        if r.halfwidth < 20:
-            continue
-        for side in (-1, 1):
-            mark = margin + round(r.x + side*r.halfwidth*.36)
-            span(row, max(left+1, mark), min(right-1, mark+1+int(r.z<2.3)), PAINT)
-
-    # World-space objects use the same depth and elevation as their road.
-    # Test each object scanline so a nearer crest can hide its lower half.
-    actors = []
-    for station in range(2, STEPS, 6):
-        z = (station-step) % STEPS
-        if TYRES <= z <= 16:
-            actors.append((z, station))
-    rival_z = TYRES + (31-step%32)*.42
-    actors.append((rival_z, None))
-    rival_x = rival_y = 0
-    for z, station in sorted(actors, key=lambda a: -a[0]):
-        r = at_distance(samples, z)
-        foot = round(r.y)
-        if station is None:
-            rival_x = round(r.x + (-1 if step<32 else 1)*r.halfwidth*.48)
-            rival_y = foot
-            h = max(3, round(31/z))
-            for dy in range(h):
-                y = foot-h+dy
-                if not visible(rows, y, z):
-                    continue
-                sy = min(23, (dy*24+12)//h)
-                for dx in range(h):
-                    x = margin+rival_x-h//2+dx
-                    if not 0 <= x < len(pic[y]):
-                        continue
-                    shape = BIKE[sy][min(23, (dx*24+12)//h)]
-                    if shape == "#":
-                        pic[y][x] = LAMP if sy<6 else TEAL if sy<16 else STEEL
-                    elif shape == ".":
-                        pic[y][x] = ASPHALT
-            continue
-        direction = 1 if profile(station, course)[1] > 0 else -1
-        for side in (-1, 1):
-            x = margin + round(r.x + side*(r.halfwidth+r.kerb+10+20/z))
-            if course == "coast" and station in (8, 38) and side == -1:
-                # A red-banded navigation tower with a lit lantern.
-                height = round(85/z)
-                for dy in range(height):
-                    y = foot-dy
-                    if visible(rows, y, z):
-                        w = max(1, round((12-5*dy/height)/z))
-                        ink = LAMP if dy > .85*height else RUBY if .38*height < dy < .63*height else STEEL
-                        span(pic[y], x-w, x+w+1, ink)
-                continue
-            if course == "ridge" and station % 12 == 2:
-                # Three overlapping whorls give the pines a readable silhouette.
-                height = round(63/z)
-                for dy in range(height):
-                    y = foot-dy
-                    if visible(rows, y, z):
-                        t = dy/height
-                        whorl = max((tip-t for base,tip in ((.12,.72),(.38,.86),(.61,1))
-                                     if t >= base), default=0)
-                        w = max(1, round(19*whorl/z))
-                        span(pic[y], x-w, x+w+1, STATIC+4 if whorl else VOID)
-                continue
-            h, w = max(2,round(26/z)), max(1,round(3/z))
-            for dy in range(h):
-                y = foot-dy
-                if visible(rows,y,z):
-                    span(pic[y], x-w,x+w, RUBY if dy>h*.65 else STEEL)
-            if z < 9 and side == -direction:
-                radius = max(2,round(12/z))
-                for dy in range(-radius//2,radius//2+1):
-                    y = foot-h+dy
-                    if visible(rows,y,z):
-                        span(pic[y],x-radius,x+radius+1,LAMP)
-                        tip = x+direction*(radius//3-abs(dy))
-                        span(pic[y],tip-1,tip+1,VOID)
-    return rival_x, rival_y
 
 
 def bitmap_offset(y, col):
@@ -227,29 +114,21 @@ def bitmap_offset(y, col):
 
 @lru_cache(maxsize=32768)
 def encode(cell):
-    # Both banks share a bitmap. Pick two materials for this cell, allowing the
-    # bitmap edge to cross an attribute boundary at single-pixel precision.
     count = Counter(cell)
-    if KERB in count and ASPHALT in count and len(count) > 2 and max(count) < STATIC:
-        # A distant rider can occupy the same cell as the inner edge. Draw
-        # its highlights in the kerb ink so both silhouettes survive the swap.
-        cell = bytes(ASPHALT if m in (ASPHALT, PAINT) else KERB for m in cell)
-        count = Counter(cell)
-    weights = {KERB: 4, PAINT: 4, STEEL: 5, LAMP: 6, RUBY: 6, TEAL: 5}
-    ranked = sorted(count, key=lambda m: count[m]*weights.get(m, 1), reverse=True)
-    paper, ink = ranked[0], ranked[min(1,len(ranked)-1)]
-    # The rider keeps background set bits under the transparent part of its
-    # mask. Keep the black asphalt clear even in a mostly painted edge cell.
-    if ink in (ASPHALT, VOID):
+    ranked = sorted(count, key=count.get, reverse=True)
+    paper, ink = ranked[0], ranked[min(1, len(ranked)-1)]
+    if ink == 0:
         paper, ink = ink, paper
-    attrs = []
-    for page in range(2):
-        p, i = MATERIALS[paper][page], MATERIALS[ink][page]
-        attrs.append(((p & 7) << 3) | (i & 7) | (64 if max(p,i) >= 8 else 0))
-    # Encode the selected ink over the shared paper.
+    # Zero-filled sky and dashboard cells use black. The static scene assigns
+    # the same palette to both screens.
+    paper_colour = max(0, paper-STATIC)
+    ink_colour = max(0, ink-STATIC)
+    attr = ((paper_colour & 7) << 3) | (ink_colour & 7)
+    if max(ink_colour, paper_colour) >= 8:
+        attr |= 64
     bits = bytes(sum(128 >> x for x in range(8) if cell[8*y+x] == ink)
                  for y in range(8)) if paper != ink else bytes(8)
-    return bytes(attrs) + bits
+    return bytes((attr, attr)) + bits
 
 
 def tiles(pic):
@@ -301,299 +180,106 @@ def riders():
     return out
 
 
-
-def course_maps(course):
-    pic = [bytearray(row[:1]*MARGIN+row+row[-1:]*MARGIN) for row in scenery(course)]
-    maps = []
-    depths = []
-    scales = []
-    for pose in range(POSES):
-        step = pose/SUBSTEPS
-        road(pic, step, course, MARGIN)
-        base = []
-        bands = geometry(pose,course)
-        for y in range(TOP,DASH,8):
-            band = (y-TOP)//8
-            use_stamp = band>=FIRST_BAND and bands[band-FIRST_BAND].use_stamp
-            for x in range(0,8*MAP_WIDTH,8):
-                cell = b"".join(line[x:x+8] for line in pic[y:y+8])
-                if use_stamp:
-                    cell = cell.translate(CLEAR_PAINT)
-                base.append(encode(cell))
-        maps.append(base)
-        rows = projection(step,course)[1]
-        depths.append(bytes(64 if r is None else int(r.z*TRAVEL_PER_STEP)%PHASES for r in rows))
-        scales.append(bytes(round(15*TYRES/r.z) if r else 0 for r in rows[4::8]))
-    return maps,depths,scales
+# IDs below map to a pair of ULA attributes. Kerb cells take priority when
+# another part of the scene passes through the same eight-pixel square.
+ATTRS = ((0x47,0x0a), (0x47,0x0a), (0x47,0x09), (0x46,0x0e),
+         (0x44,0x0c), (0x47,0x0f), (0x42,0x0a), (0x45,0x0d))
 
 
-# White on bright black / red on normal blue. A bitmap bit marks the
-# same kerb pixel on both screens.
-KERB_ATTRS = bytes((0x47, 0x0a))
-ROAD_TILE = encode(bytes([ASPHALT])*64)
-SOLID_KERB = encode(bytes([KERB])*64)
-LANE_ATTRS = encode(bytes([ASPHALT, PAINT])*32)[:2]
-CLEAR_PAINT = bytes.maketrans(bytes([KERB, PAINT]), bytes([ASPHALT, ASPHALT]))
+def sprite_shape(kind,height):
+    """Transparent spans, in pixel coordinates local to the sprite."""
+    rows=[]
+    for y in range(height):
+        t=(y+.5)/height
+        if kind=="bike":
+            source=BIKE[min(23,int(t*24))]
+            width=height
+            ink=[source[min(23,(x*24+12)//width)]=="#" for x in range(width)]
+            style=3 if t<.29 else 7 if t<.66 else 5
+        else:
+            width=max(3,round(height*(.64 if kind=="tree" else .40)))|1
+            mid=width//2
+            if kind=="tree":
+                extent=1 if t>.9 else max(1,round(mid*max(
+                    (t-base)/(bottom-base) for base,bottom in ((0,.53),(.24,.71),(.43,.91)) if t>=base and (t<bottom or base==.43))))
+                ink=[abs(x-mid)<extent for x in range(width)]
+                style=4
+            elif kind=="tower":
+                extent=max(1,round(mid*(.65+.35*t)))
+                ink=[abs(x-mid)<extent for x in range(width)]
+                style=3 if t<.2 else 6 if .42<t<.63 else 5
+            else:
+                ink=[t<.34 or abs(x-mid)<=max(0,width//7) for x in range(width)]
+                style=3 if t<.34 else 5
+        runs=[]
+        for x,on in enumerate(ink):
+            if on and (x==0 or not ink[x-1]):
+                runs.append([x,0])
+            if on: runs[-1][1]+=1
+        rows.append((style,runs))
+    return width,rows
 
 
-def kerb_tile(bits):
-    if not any(bits):
-        return ROAD_TILE
-    if bits==bytes([255])*8:
-        return SOLID_KERB
-    return KERB_ATTRS+bits
+def actors(pose,course):
+    step=pose/SUBSTEPS
+    samples,rows=projection(step,course)
+    objects=[]
+    for station in range(2,STEPS,6):
+        z=(station-step)%STEPS
+        if not TYRES<=z<=16: continue
+        r=at_distance(samples,z)
+        section=surface(pose,course)[max(0,min(LINES-1,round(r.y)-FIRST))]
+        cx,half=(section[:2] if section else (r.x,r.halfwidth))
+        for side in (-1,1):
+            kind=("tower" if course=="coast" and station in (8,38) and side==-1 else
+                  "tree" if course=="ridge" and station%12==2 else "post")
+            h=max(3,min(24,round({"tower":85,"tree":63,"post":26}[kind]/z)))
+            x=round(cx+side*(half+r.kerb+14+20/z))
+            objects.append((z,kind,h,x,round(r.y),camera_scale(round(r.y))))
+    z=TYRES+(31-step%32)*.42
+    r=at_distance(samples,z)
+    h=max(3,min(24,round(31/z)))
+    section=surface(pose,course)[max(0,min(LINES-1,round(r.y)-FIRST))]
+    cx,half=(section[:2] if section else (r.x,r.halfwidth))
+    x=round(cx+(-1 if step<32 else 1)*half*.48)
+    objects.append((z,"bike",h,x,round(r.y),camera_scale(round(r.y))))
+    result=[]
+    for z,kind,h,x,foot,w in sorted(objects,reverse=True):
+        # Seven depth scales share silhouettes across both circuits.
+        h=min((3,5,7,10,14,19,24),key=lambda a:abs(a-h))
+        width,_=sprite_shape(kind,h)
+        top=foot-h+1
+        start=max(0,FIRST-top)
+        end=min(h,DASH-top)
+        vis=[i for i in range(start,end) if visible(rows,top+i,z)]
+        if vis and -125<=x-width//2<=380:
+            result.append((kind,h,x-width//2,top,vis[0],vis[-1]+1,w))
+    return result
 
 
-def stroke_usage(course):
-    uses = Counter()
-    for pose in range(POSES):
-        for band in geometry(pose,course):
-            if not band.use_stamp:
-                continue
-            for lane in range(8,249,4):
-                a = camera_shift(lane,band.start.scale)
-                b = camera_shift(lane,band.end.scale)
-                for side,w in ((0,band.width),(1,band.width),(3,2),(4,2)):
-                    start = round(band.start[side]/4)-a
-                    end = round(band.end[side]/4)-b
-                    slope = 4*(end-start)
-                    assert slope in SLOPES
-                    visible = max(start,end)*4+w>0 and min(start,end)*4<WIDTH
-                    weight = 1 + 4*visible + 6*(visible and 56<=lane<=200)
-                    uses[slope,w,4*(min(start,end)%2)] += weight
-    return uses
+def backdrop(course):
+    pic=scenery(course)
+    sky=pic[:64]
+    for y in range(FIRST):
+        pic[y]=sky[y*64//FIRST]
+    base=tiles(pic)
+    pair=[screen(base,b) for b in (0,1)]
+    for b,scr in enumerate(pair):
+        for y in range(FIRST,DASH):
+            pos=bitmap_offset(y,0)
+            scr[pos:pos+32]=bytes(32)
+        scr[6144+FIRST*4:6144+DASH*4]=bytes([ATTRS[0][b]])*((DASH-FIRST)*4)
+    return pair
 
 
-@lru_cache(maxsize=2)
-def stroke_templates(course):
-    uses = stroke_usage(course)
-    selected = {}
-    options = {}
-    counts = Counter()
-    for key in sorted(uses):
-        slope,width,phase = key
-        variants = {}
-        for gx,gy in ((4,4),(2,4),(4,2),(2,2),(1,2),(4,1),(2,1),(1,1)):
-            bits = masks(*key,gx,gy)
-            tiles = tuple((LANE_ATTRS+b if any(b) else ROAD_TILE) if width==2 else kerb_tile(b)
-                          for b in bits)
-            # Penalise unequal steps and errors where two bands join. Every
-            # candidate still has one uninterrupted run of the specified width.
-            shifts = stroke_offsets(slope,gx,gy)
-            exact = stroke_offsets(slope)
-            diff = [a-b for a,b in zip(shifts,exact)]
-            error = sum(e*e for e in diff) + 6*(diff[0]**2+diff[-1]**2)
-            error += 2*sum((a-b)**2 for a,b in zip(diff,diff[1:]))
-            variants[tiles] = error
-        options[key] = [(tiles,err,set(tiles)) for tiles,err in variants.items()]
-        chosen = min(options[key],key=lambda v:v[1]) if width==2 or abs(slope)<=20 else options[key][0]
-        selected[key] = chosen
-        counts.update(chosen[2])
-
-    # Spend the remaining tile IDs improving the most visible stair steps.
-    # Replacing a template releases any masks it alone was using.
-    budget = 224
-    assert len(counts)<=budget
-    while True:
-        best, score = None, 0
-        for key,(_,old_error,old_tiles) in selected.items():
-            for candidate in options[key]:
-                _,error,tiles = candidate
-                if error>=old_error:
-                    continue
-                added = sum(t not in counts for t in tiles-old_tiles)
-                freed = sum(counts[t]==1 for t in old_tiles-tiles)
-                if len(counts)+added-freed>budget:
-                    continue
-                improvement = (error-old_error)*uses[key]**.8 / max(1,added-freed)
-                if improvement>score:
-                    best,score = (key,candidate),improvement
-        if best is None:
-            break
-        key,candidate = best
-        for t in selected[key][2]-candidate[2]:
-            counts[t]-=1
-            if not counts[t]:
-                del counts[t]
-        counts.update(candidate[2]-selected[key][2])
-        selected[key] = candidate
-    empty = (ROAD_TILE,)*STAMP_CELLS
-    return [tile for s in SLOPES for w in WIDTHS for p in STROKE_PHASES
-            for tile in (selected[s,w,p][0] if (s,w,p) in selected else empty)]
-
-
-def tile_features(tile):
-    rows = tile[2:]
-    bits = int.from_bytes(rows, "little")
-    if tile[:2] not in (KERB_ATTRS, LANE_ATTRS):
-        return bits
-    # Pack extra copies of boundary pixels and occupied-row flags into the
-    # distance metric. This keeps a thin diagonal from losing its tip.
-    occupied = sum(bool(row) << y for y,row in enumerate(rows))
-    borders = bits & 0xff818181818181ff
-    return bits | (borders << 64) | ((occupied * 0x0101010101010101) << 128)
-
-
-def tile_atlas(strips, stamps=()):
-    # Keep both attributes exact. Spend the remaining tile IDs on common
-    # bitmaps, then match rarer edge shapes by their eight scanline masks.
-    counts = Counter(t for row in strips for t in row)
-    if stamps:
-        # Keep every selected stroke tile exact, including at full steering lock.
-        counts.update(stamps)
-        counts[ROAD_TILE] += sum(counts.values())
-    groups = {}
-    for t,_ in counts.most_common():
-        groups.setdefault(t[:2],[]).append(t)
-    if len(groups)>256:
-        raise ValueError("A road half exceeds the 256 tile attribute pairs available")
-    reserved = list(dict.fromkeys([g[0] for g in groups.values()] + list(stamps)))
-    assert len(reserved)<=256
-    atlas = list(dict.fromkeys(reserved + [t for t,_ in counts.most_common()]))[:256]
-    # Fit remaining scenery paint slots to a range of slopes. Weight the
-    # remaining error by use count so rare shapes cannot crowd out common ones.
-    for paint in (KERB_ATTRS, LANE_ATTRS):
-        slots = [i for i,t in enumerate(atlas) if t[:2]==paint and (not stamps or i>=len(reserved))]
-        if not slots:
-            continue
-        variants = groups[paint]
-        features = [tile_features(t) for t in variants]
-        weights = [counts[t] for t in variants]
-        distances = [256]*len(variants)
-        chosen = 0
-        for slot in slots:
-            atlas[slot] = variants[chosen]
-            centre = features[chosen]
-            distances = [min(d,(v^centre).bit_count()) for v,d in zip(features,distances)]
-            chosen = max(range(len(variants)),key=lambda i: weights[i]*distances[i]**2)
-    candidates = {pair:[(i,tile_features(t)) for i,t in enumerate(atlas) if t[:2]==pair]
-                  for pair in groups}
-    mapping = {t:i for i,t in enumerate(atlas)}
-    for t in counts.keys()-mapping.keys():
-        bits = tile_features(t)
-        mapping[t] = min(candidates[t[:2]],key=lambda c:(c[1]^bits).bit_count())[0]
-    return atlas, mapping
-
-
-def map_delta(old, new):
-    # 01..7F skips unchanged cells. 81..FF copies literal tile IDs.
-    data = bytearray()
-    i = 0
-    while i < len(new):
-        changed = old[i] != new[i]
-        j = i+1
-        while j < len(new) and j-i < 127:
-            if changed:
-                if old[j]==new[j] and (j+1==len(new) or old[j+1]==new[j+1]):
-                    break
-            elif old[j]!=new[j]:
-                break
-            j += 1
-        if changed or j!=len(new):
-            data.append((128 if changed else 0) + j-i)
-            if changed:
-                data.extend(new[i:j])
-        i = j
-    return data + b"\0"
-
-
-def artwork(course):
-    maps,depths,scales = course_maps(course)
-    half = len(maps[0])//2
-    ids = [bytearray() for _ in maps]
-    atlases = []
-    stamps = stroke_templates(course)
-    for n in range(2):
-        strips = [m[n*half:(n+1)*half] for m in maps]
-        atlas,mapping = tile_atlas(strips,stamps if n else ())
-        if n:
-            assert atlas[0]==ROAD_TILE
-            stamp_ids = bytes(mapping[t] for t in stamps)
-        atlases.append(atlas)
-        for dst,strip in zip(ids,strips):
-            dst.extend(mapping[t] for t in strip)
-    # Hold sub-pixel edge noise until it visibly changes the tile. Compare
-    # against the last emitted shape, so successive small movements accumulate.
-    for half_index,atlas in enumerate(atlases):
-        bits = [tile_features(t) for t in atlas]
-        # Holding a previous tile must preserve the occupied paint scanlines.
-        coverage = [tuple(map(bool,t[2:])) if t[:2] in (KERB_ATTRS,LANE_ATTRS) else None for t in atlas]
-        close = []
-        for i,a in enumerate(bits):
-            kerb = atlas[i][:2]==KERB_ATTRS
-            # Hold small shape changes, but preserve the presence of the
-            # stripe where this tile meets the rows immediately above/below.
-            tolerance = 16 if kerb else 5
-            matches = {j for j,b in enumerate(bits) if atlas[i][:2]==atlas[j][:2]
-                       and coverage[i]==coverage[j] and (a^b).bit_count()<=tolerance}
-            close.append(matches)
-        begin = half_index*half
-        previous = ids[-1][begin:begin+half]
-        original = [m[begin:begin+half] for m in ids]
-        # Two laps settle the threshold at the join as well as on the straights.
-        for lap in range(2):
-            for m,row in zip(ids,original):
-                previous = bytearray(b if b in close[a] else a for a,b in zip(row,previous))
-                if lap:
-                    m[begin:begin+half] = previous
-    return ids,depths,scales,atlases,stamp_ids
-
-
-def roadside(strip):
-    # The high bit of the column ends each row. Native code can pop a
-    # column/tile pair directly from the course bank while the IRQ is masked.
-    data = bytearray()
-    for start in range(0,len(strip),MAP_WIDTH):
-        cells = [(x,t) for x,t in enumerate(strip[start:start+MAP_WIDTH]) if t]
-        for i,(x,tile) in enumerate(cells or [(63,0)]):
-            data.extend((x | (128 if i+1>=len(cells) else 0),tile))
-    return data
-
-
-def generate(out: Path, course):
-    ids,depths,scales,atlases,stamp_ids = artwork(course)
-    half = len(ids[0])//2
-    for n,atlas in enumerate(atlases):
-        (out/f"atlas{n}.bin").write_bytes(b"".join(atlas))
-    (out/"stamps.inc").write_text(stamp_source(stamp_ids))
-    (out/"edge-math.bin").write_bytes(math_data())
-    (out/"geometry.bin").write_bytes(geometry_data(0,course))
-    (out/"roadside.bin").write_bytes(roadside(ids[0][half:]))
-    shown = bytearray(ids[0][row*MAP_WIDTH+MARGIN//8+x] for row in range(16) for x in range(32))
-    shown[256:] = overlay_kerbs(shown[256:],0,128,course,stamp_ids)
-    (out/"shown.bin").write_bytes(shown)
-    (out/"world.bin").write_bytes(ids[0][:half])
-    initial = tiles(scenery(course))
-    initial[TOP*4:DASH*4] = [atlases[i//256][tile] for i,tile in enumerate(shown)]
-    for bank in range(2):
-        (out/f"screen{bank}.bin").write_bytes(screen(initial,bank))
-    (out/"depth0.bin").write_bytes(depths[0])
-    (out/"scale0.bin").write_bytes(scales[0])
+def generate(out,course):
+    from strokes import compile_scene
+    compile_scene(out,course)
     (out/"riders.bin").write_bytes(riders())
-    # Keep both halves of each quarter-step together in a pageable bank.
-    pages = [bytearray() for _ in PAGES]
-    limits = [STAMP_ADDR if p==7 else 0x10000 for p in PAGES]
-    descriptor = []
-    for q in range(POSES):
-        d = depths[q]
-        upper = map_delta(ids[q-1][:half],ids[q][:half])+d[:64]+scales[q][:8]
-        lower = d[64:]+scales[q][8:]+geometry_data(q,course)+roadside(ids[q][half:])
-        route = pack("<H",len(upper))+upper+lower
-        index = min(range(len(pages)),key=lambda i:PAGE_START[PAGES[i]]+len(pages[i])-limits[i])
-        page = pages[index]
-        descriptor.append(f"    dw {PAGE_START[PAGES[index]]+len(page)}\n    db {16+PAGES[index]}, "
-                          f"{drift(q//SUBSTEPS,course)*(1 if q%2 else 2) & 255}")
-        page.extend(route)
-        if PAGE_START[PAGES[index]]+len(page)>limits[index]:
-            raise ValueError(f"{course} course exceeds bank {PAGES[index]} at pose {q}")
-    for page,data in zip(PAGES,pages):
-        (out/f"page{page}.bin").write_bytes(data)
-    (out/"course.inc").write_text("\n".join(descriptor)+"\n")
-    (out/"layout.inc").write_text(f"RASTER_TOP equ {TOP}\nDASH equ {DASH}\nMAP_WIDTH equ {MAP_WIDTH}\n"
-                                  f"STROKE_TABLE equ {STAMP_ADDR}\nSHIFT_TABLE equ {SHIFT_ADDR}\n"
-                                  f"SUBSTEP_TRAVEL equ {TRAVEL_PER_STEP//SUBSTEPS}\n"
-                                  f"EARLY_TILES equ {EARLY_TILES}\nEXTRA_TILES equ {EXTRA_TILES}\n")
-    # One fixed-point perspective offset per band, expressed in map columns.
-    (out/"scroll.bin").write_bytes(bytes(max(0,min(MAP_WIDTH-32, MARGIN//8+round((lane-128)*z/(15*8))))
-                                         for z in range(16) for lane in range(0,256,4)))
-    return [p for p,data in zip(PAGES,pages) if data]
+    for bank,data in enumerate(backdrop(course)): (out/f"screen{bank}.bin").write_bytes(data)
+    (out/"layout.inc").write_text(f"FIRST equ {FIRST}\nDASH equ {DASH}\nLINES equ {LINES}\n"
+        f"SUBSTEP_TRAVEL equ {TRAVEL_PER_STEP//SUBSTEPS}\n")
+    (out/"attr0.bin").write_bytes(bytes(a for a,b in ATTRS))
+    (out/"attr1.bin").write_bytes(bytes(b for a,b in ATTRS))
+    (out/"fine-slope.bin").write_bytes(b"".join(pack("<h",nearest((lane-128)*128/112)) for lane in range(256)))
+    return PAGES

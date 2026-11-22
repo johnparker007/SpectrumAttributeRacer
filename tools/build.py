@@ -7,8 +7,8 @@ import shutil
 import subprocess
 from struct import pack
 
+from strokes import SHAPE_BASE
 from course import FONT, PAGE_START, generate
-from kerbs import SHIFT_ADDR, STAMP_ADDR
 from route import COURSES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,9 +52,12 @@ def build(assembler, out=BUILD, course="coast"):
 
     assemble(ROOT/"src/racer.asm")
     blocks = [(0x10, 0x8000, "core.bin"), (0x10, 0x4000, "screen0.bin"),
-              (0x17, 0xc000, "screen1.bin"), (0x17, STAMP_ADDR, "stamps.bin"),
-              (0x10, SHIFT_ADDR, "edge-math.bin"), (0x10, 0x6000, "working.bin")]
+              (0x17, 0xc000, "screen1.bin")]
+    blocks += [(0x10,0xc000,"glyphs.bin"), (0x16,SHAPE_BASE,"shapes.bin"), (0x11,0xfc00,"descriptors.bin"), (0x16,0xfe00,"fine-slope.bin"),
+               (0x17,0xdb00,"copy7.bin"), (0x10,0x7100,"copy5high.bin")]
     blocks += [(0x10+page, PAGE_START[page], f"page{page}.bin") for page in pages]
+    # This code occupies the former 128K BASIC workspace. Install it last.
+    blocks.append((0x10, 0x5b00, "copy5.bin"))
     (out/"blocks.inc").write_text("".join(f"    db {latch}\n    dw {addr},{(out/file).stat().st_size}\n"
                                          for latch,addr,file in blocks))
     assemble(ROOT/"src/loader.asm")
