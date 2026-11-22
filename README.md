@@ -18,9 +18,17 @@ Open either TAP with tape autoload on a 128K Spectrum, +2 or +2A emulator. Enabl
 | O / P | Move left / right at one lane unit per 50 Hz tick in every gear. Release to hold your position through bends. Pressing both keys also holds position. |
 | Q / A | Shift up / down through four gears |
 
-## PC road reference
+## Flat-road Python prototype
 
-Double-click `Preview-Road.bat` on Windows or run `python tools/preview_road.py` with Python and Tkinter. The left panel draws the floating-point road one scanline at a time at fractional course positions. The right panel shows the geometry the Z80 can draw from the same course, including its two-pixel endpoint grid and integer course positions. Both panels show road paint only. The TAP adds scenery, riders and the timed screen effects.
+Double-click `Preview-Road.bat` or run `python tools/preview_flat.py`. This is the PC-only Hang-On appearance study. Choose one of four camera positions drawn from the supplied references. Each opens paused. Space starts or stops travel, O/P or the arrow keys move directly across the road, and the Lap slider scrubs the circuit. Toggle Rider to inspect the kerbs. The Speed slider changes the distance travelled per second.
+
+The horizon is fixed. A flat-plane perspective projection sets the width and depth of every scanline. The renderer integrates the curvature of the upcoming track relative to the camera heading. Paint and roadside objects use the same distance as the road. Edit `tools/flat_road.py` to tune the track, camera and colours. The comparison below shows the opening straight and coastal right above the desert right and left.
+
+![Four flat-road prototype views](docs/flat-road.png)
+
+## Previous Spectrum road reference
+
+Run `python tools/preview_road.py` with Python and Tkinter. The left panel draws the floating-point road one scanline at a time at fractional course positions. The right panel shows the geometry the Z80 can draw from the same course, including its two-pixel endpoint grid and integer course positions. Both panels show road paint only. The TAP adds scenery, riders and the timed screen effects.
 
 Uncheck **Run** or press Space to freeze the road. Scrub **Track position** to inspect a bend, then drag **Lane** or hold O/P to move across it. Select either course and any of the four gears. The PC playback rate follows the selected gear's distance increment. Emulator captures measure the actual Z80 frame cadence.
 
