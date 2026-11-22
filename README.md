@@ -15,7 +15,7 @@ Open either TAP with tape autoload on a 128K Spectrum, +2 or +2A emulator. Enabl
 
 | Keys | Action |
 | --- | --- |
-| O / P | Steer left / right. The bike leans near the centre and the foreground road shifts underneath it. |
+| O / P | Move left / right at one lane unit per 50 Hz tick in every gear. Release to hold your position through bends. Pressing both keys also holds position. |
 | Q / A | Shift up / down through four gears |
 
 ## Build and test
@@ -34,10 +34,10 @@ Both commands accept `--course coast` or `--course ridge`. The verifier also acc
 The starting point was the shmup's Ringo-8/Blokius renderer. An interrupt synchronises the frame, and scheduled writes to `#7FFD` let the ULA fetch colours from either screen. The racer has its own raster loop, course compiler and sprite compositor. [Shmup source and timing measurements](https://github.com/johnparker007/SpectrumAttributeShmup/blob/b9f0878/docs/timing-baseline.md)
 
 * Each circuit has 256 camera positions around a closed elevation and curvature profile. A crest can hide a valley or a rider. The compiler follows the first visible road line over crests, limits how quickly its centre moves around the lap, and blends it into the approaching bend.
-* O and P move the road beneath the rider. The two kerbs and the dashed centreline follow the same camera. Adjacent eight-scanline sections share their endpoints. Between those endpoints the renderer tapers the paint on each individual scanline. The compiler keeps endpoints to half a pixel and smooths them across nine camera positions. The Z80 combines each endpoint with the steering offset, then rounds once to the two-pixel grid at the crest and in the foreground, with a four-pixel grid between them. Cornering drift follows the curvature at the tyres. [See the earlier kerb continuity comparison](docs/kerb-comparison.png)
+* O and P move the road beneath the rider. The two kerbs and the dashed centreline follow the same camera. Adjacent eight-scanline sections share their endpoints. Between those endpoints the renderer tapers the paint on each individual scanline. The compiler keeps endpoints to half a pixel and smooths them across nine camera positions. The Z80 combines each endpoint with the steering offset, then rounds once to the two-pixel grid at the crest and in the foreground, with a four-pixel grid between them. [See the earlier kerb continuity comparison](docs/kerb-comparison.png)
 * Bright bands show white paint on black. Normal-intensity bands show red kerbs on blue. A single two-pixel white centreline appears in the bright foreground bands. Road paint has priority where a roadside object shares its colour cell.
 * The Z80 prepares the next bend in spare RAM. In the bottom 32 road scanlines it also draws an intermediate position of the kerbs and centreline. The top of that section stays joined to the existing bend. The patch preserves the rider and roadside colour cells, and a full update restores every touched bitmap block.
-* The colour bands scroll at 50 Hz. Lateral camera travel is capped at three lane units per complete view. Run `python tools/measure_motion.py --course coast --input right` to measure the actual pixel steps and hold times at the bottom of the screen. Both courses support `right` and `none` input fixtures.
+* The colour bands scroll at 50 Hz. Each new road view samples the current lateral position directly. Run `python tools/measure_motion.py --course coast --input right` to measure the actual pixel steps and hold times at the bottom of the screen. Both courses support `right` and `none` input fixtures.
 
 Edit the elevation and curvature in [tools/route.py](tools/route.py), the projected kerbs in [tools/kerbs.py](tools/kerbs.py), the compiled paint shapes in [tools/strokes.py](tools/strokes.py), and the native renderer in [src/racer.asm](src/racer.asm).
 

@@ -204,23 +204,16 @@ prepare:
     ld a,(forward) : or a : jr z,.station
     xor a : ld (forward),a
     ld a,(pose) : inc a : ld (pose),a
-    ld l,a : ld h,0 : add hl,hl : add hl,hl : ld de,course+3 : add hl,de
-    ld a,(lane) : add a,(hl) : cp 8 : jr nc,.upper : ld a,8
-.upper: cp 249 : jr c,.lane : ld a,248
-.lane: ld (lane),a
     ld a,(pose) : and 127 : cp 124 : call z,judgePass
 .station:
     ld a,(pose) : ld (drawingPose),a
-    ld l,a : ld h,0 : add hl,hl : add hl,hl
+    ld l,a : ld h,0 : ld d,h : ld e,l : add hl,hl : add hl,de
     ld de,course : add hl,de : ld e,(hl) : inc hl : ld d,(hl)
     inc hl : ld a,(hl) : ld (selectedBank),a : ld bc,#7ffd : out (c),a
     ex de,hl : ld c,(hl) : inc hl : ld b,(hl) : inc hl : ld de,sceneData : ldir
     ld a,#16 : ld (selectedBank),a : ld bc,#7ffd : out (c),a
     ld a,(lean) : ld (drawingLean),a
-    ld a,(displayLane) : ld b,a : ld a,(lane) : sub b : jr c,.negative
-    cp 4 : jr c,.shift : ld a,3 : jr .shift
-.negative: cp 253 : jr nc,.shift : ld a,253
-.shift: add a,b : ld (drawingLane),a
+    ld a,(lane) : ld (drawingLane),a
     ; Projection and scenery both use 128 + scale * steering. Keep all 113
     ; products in one little-endian table. The cell palette grid is applied
     ; only when the product is consumed.
@@ -652,11 +645,11 @@ controls:
     ret
 
 steerLeft:
-    ld a,(lane) : cp 10 : ret c
-    sub 2 : ld (lane),a : ret
+    ld a,(lane) : cp 8 : ret z
+    dec a : ld (lane),a : ret
 steerRight:
-    ld a,(lane) : cp 247 : ret nc
-    add a,2 : ld (lane),a : ret
+    ld a,(lane) : cp 248 : ret z
+    inc a : ld (lane),a : ret
 
 judgePass:
     ; The bike is anchored at X=124. Lane is the world-space camera offset.

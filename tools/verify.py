@@ -12,7 +12,7 @@ import tempfile
 from build import BUILD, executable
 from course import ATTRS, riders
 from kerbs import FIRST, LINES, bands, nearest, projected, ribbons, surface
-from route import COURSES, DASH, drift
+from route import COURSES, DASH
 from strokes import object_cells
 
 FRAME, LINE = 70908, 228
@@ -280,10 +280,32 @@ def check_drive(emu,model,image,s,course,folder,seconds,keys=True,tape=False,ful
 
 
 def check_controls(emu,model,image,s,folder):
-    spool=folder/"gears.txt";spool.write_bytes(b"pqoapqoa "*20)
+    spool=folder/"gears.txt"
     def peek(name):return f"PEEK({s[name]:04X}H)"
-    ev=trace(emu,image,model,5,s,[("tick",peek("gear")+"+256*"+peek("lane"))],spool)
-    require(len({x%256 for _,x in ev})>=2 and len({x//256 for _,x in ev})>4,f"{model} O/P/Q/A path")
+    # Sample after the keyboard poll and at the point where the renderer takes
+    # its camera snapshot. A queued target would keep moving after release.
+    state = peek("lane")+"+256*"+peek("lean")+"+1024*"+peek("gear")
+    camera = peek("lane")+"+256*"+peek("drawingLane")
+    for start, keys, limit in ((10,b"ooo ppp q a ",8), (246,b"ppp ooo a q ",248)):
+        spool.write_bytes(keys*10)
+        ride = fixture(folder,"steer",image,s,lane=start,displayLane=start)
+        ev = trace(emu,ride,model,7,s,[("tick",state),("prepare.cachedLane",camera)],spool)
+        previous = start
+        lanes, leans, gears = set(), set(), set()
+        cameras = 0
+        for label,value in ev:
+            lane = value % 256
+            if label == "prepare.cachedLane":
+                require(lane == value//256, f"{model} camera lagged the sampled lane")
+                cameras += 1
+                continue
+            lean = value//256 % 4
+            require(lane == max(8,min(248,previous+lean-1)),
+                    f"{model} steering step from {previous} to {lane}, lean {lean}")
+            previous = lane
+            lanes.add(lane); leans.add(lean); gears.add(value//1024)
+        require(limit in lanes and len(lanes)>4 and leans=={0,1,2} and len(gears)>1 and cameras>5,
+                f"{model} incomplete direct steering exercise")
     collision=fixture(folder,"contact",image,s,pose=123,gear=4,lane=78,displayLane=78)
     ev=trace(emu,collision,model,3,s,[("tick",peek("gear")+"+256*"+peek("bump"))])
     require(any(v%256==4 and v>=256 for _,v in ev),f"{model} missed collision")
@@ -308,14 +330,11 @@ def check_controls(emu,model,image,s,folder):
 
 def check_kerb_motion(course):
     # These scanlines reversed direction repeatedly through the same bend.
-    # Isolate the camera from player input while keeping the game's curve drift.
-    for initial_lane in (8,64,128,192,248):
-        lane = initial_lane
+    # With the keys released, the lateral camera coordinate stays fixed.
+    for lane in (8,64,128,192,248):
         previous = None
         for step in range(257):
             pose = step % 256
-            if step:
-                lane = max(8, min(248, lane + drift(pose, course)))
             crest, points = bands(pose, course)
             a,b = (projected(p,lane) for p in points[:2])
             # Measure at the actual (moving) first visible scanline.
@@ -325,14 +344,12 @@ def check_kerb_motion(course):
                 require(abs(centre-previous) <= 3, f"{course} horizon jumped at pose {pose}")
             previous = centre
 
-    cases = ([(239, 128, 137, 0, True), (184, 128, 84, 0, False)]
-             if course == "coast" else [(182, 155, 152, 1, True)])
-    for first_pose, lane, y, side, drifting in cases:
+    cases = ([(239, 128, 137, 0), (184, 128, 84, 0)]
+             if course == "coast" else [(182, 155, 152, 1)])
+    for first_pose, lane, y, side in cases:
         positions = []
         for step in range(5):
             pose = (first_pose + step) % 256
-            if step and drifting:
-                lane = max(8, min(248, lane + drift(pose, course)))
             crest, points = bands(pose, course)
             band = (y - FIRST)//8 - crest//8
             a, b = (projected(point, lane)[side] for point in points[band:band+2])

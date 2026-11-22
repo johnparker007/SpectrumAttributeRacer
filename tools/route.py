@@ -107,10 +107,3 @@ def at_distance(samples, z):
     a, b = samples[index:index+2]
     t = (z-a.z)/(b.z-a.z)
     return Section(z, a.y+t*(b.y-a.y), a.x+t*(b.x-a.x))
-
-
-def drift(pose, course):
-    """Lateral push for one quarter-station, sampled at the tyres."""
-    _, turn = profile(pose / 4 + TYRES, course)
-    magnitude = int(abs(turn) > .085) + int(abs(turn) > .32)
-    return -magnitude if turn > 0 else magnitude

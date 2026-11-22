@@ -6,7 +6,6 @@ from struct import pack
 
 from course import actors, sprite_shape
 from kerbs import FIRST, LINES, bands, masks, ribbons, surface
-from route import drift
 
 EMPTY = bytes(8)
 SHAPE_BASE = 0xc000  # Bank 6
@@ -152,8 +151,7 @@ def compile_scene(out, course):
         address = 0xc000 + len(pages[page])
         pages[page].extend(records[pose])
         assert len(pages[page]) <= limits[page], f"{course} overflows course bank {page}"
-        steering = drift(pose, course)
-        index[pose] = f"    dw {address}\n    db {16+page},{steering & 255}"
+        index[pose] = f"    dw {address}\n    db {16+page}"
     for page, data in pages.items():
         (out / f"page{page}.bin").write_bytes(data)
     (out / "band-meta.bin").write_bytes(meta)
