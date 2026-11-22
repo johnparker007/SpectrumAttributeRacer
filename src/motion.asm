@@ -135,7 +135,7 @@ addressBand:
 output:
     ld hl,0 : ld (hl),e : inc hl : ld (hl),d : inc hl
     ld a,(mask) : ld (hl),a : inc hl : ld (output+1),hl : ret
-widths: db 6,7,7,8,9
+widths: include "motion-widths.inc"
 startBits: db #80,#40,#20,#10,#08,#04,#02,#01
 oldX: db 0
 mask: db 0

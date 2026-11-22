@@ -122,11 +122,11 @@ def compile_scene(out, course):
         first, points = bands(pose, course)
         levels = depth_data(surface(pose, course))
         record = bytearray((first, len(points) - 1, len(levels))) + levels
-        for i, (scale, left, right, mark, width, painted, grid) in enumerate(points):
+        for i, (scale, left, right, mark, width, painted) in enumerate(points):
             table = 0 if i == len(points) - 1 else 2 * pairs.index((width, points[i+1][4]))
             j = 2 * (first // 8 + i)
             meta[j:j+2] = bytes((scale | (128 if painted else 0), table))
-            fractions = ((left & 3) << 6) | ((right & 3) << 4) | ((mark & 3) << 2) | int(grid == 4)
+            fractions = ((left & 3) << 6) | ((right & 3) << 4) | ((mark & 3) << 2)
             record.extend((fractions, left >> 2, right >> 2, mark >> 2))
         objects = object_cells(pose, course)
         record.append(len(objects))
@@ -156,6 +156,9 @@ def compile_scene(out, course):
         (out / f"page{page}.bin").write_bytes(data)
     (out / "band-meta.bin").write_bytes(meta)
     (out / "course.inc").write_text("\n".join(index) + "\n")
+    # The intermediate foreground view uses the very same compiled paint widths.
+    widths = [point[4]//2 for point in bands(0,course)[1][-5:]]
+    (out / "motion-widths.inc").write_text("    db " + ",".join(map(str,widths)) + "\n")
     (out / "shape-layout.inc").write_text(
         f"CENTRE_BASE equ {slope_tables[2, 2]}\nSHAPE_BASE equ {SHAPE_BASE}\n"
     )

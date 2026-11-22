@@ -257,16 +257,12 @@ prepare:
     ld a,(iy) : ld (ix),a : add a,a : ld e,a : ld d,high roadShift
     ld a,(de) : ld c,a : inc e : ld a,(de) : ld e,a
     ld d,(hl) : inc hl
-    ld a,d : and 1 : rrca : sub c : ld c,a
+    xor a : sub c : ld c,a
     ld a,1 : sbc a,e : ld e,c : ld c,a
     dup 3,i
         ld a,d : and #c0 : add a,e : ld a,(hl) : adc a,c : ld (ix+i+1),a
         inc hl : rlc d : rlc d
     edup
-    ; Six rotations leave the saved coarse-grid flag in bit 6.
-    bit 6,d : jr z,.fine
-    res 0,(ix+1) : res 0,(ix+2) : res 0,(ix+3)
-.fine:
     ld a,(iy+1) : ld (ix+4),a : inc iy : inc iy : ld de,5 : add ix,de
     djnz .project
     ld (objectsPtr+2),hl

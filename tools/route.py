@@ -65,8 +65,7 @@ class Section:
         return round(2.25 + 19.75 / self.z)
 
 
-@lru_cache(maxsize=None)
-def projection(step, course):
+def project_view(step, course):
     """Near-to-far samples and the nearest visible surface on each screen line."""
     height, _ = profile(step + TYRES, course)
     # The camera looks level. Elevation is relative to the point below the
@@ -100,6 +99,11 @@ def projection(step, course):
             rows[next_y-TOP] = Section(a.z + t*(b.z-a.z), next_y, a.x + t*(b.x-a.x))
             next_y -= 1
     return samples, rows
+
+
+# The compiler revisits the same 256 poses per circuit. The interactive
+# reference can also project arbitrary fractional positions without caching.
+projection = lru_cache(maxsize=512)(project_view)
 
 
 def at_distance(samples, z):

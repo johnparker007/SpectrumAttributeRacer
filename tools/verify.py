@@ -359,8 +359,31 @@ def check_kerb_motion(course):
                 f"{course} kerb reversed at scanline {y}, pose {first_pose}: {positions}")
 
 
+def check_reference(course):
+    from road_model import lap
+    # Rasterise the port's spans, including the outer edge of tapered paint.
+    # Compare to the double-precision model before any knot or grid rounding.
+    worst = 0.0
+    for pose, view in enumerate(lap(course)):
+        crest, knots = bands(pose,course)
+        for lane in (8,64,128,192,248):
+            points = [projected(k,lane) for k in knots]
+            for y in range(FIRST+crest,DASH):
+                band = (y-FIRST)//8-crest//8
+                a,b = points[band:band+2]
+                ideal = view.boundaries(y,lane)
+                for edge,(i,outer) in enumerate(((0,False),(0,True),(1,False),(1,True))):
+                    start = 2*(a[i]-64)+(a[3] if outer else 0)
+                    end = 2*(b[i]-64)+(b[3] if outer else 0)
+                    pixel = start+((end-start)*(y%8)+4)//8
+                    worst = max(worst,abs(pixel-ideal[edge]))
+    require(worst <= 3, f"{course} kerb exceeded the reference by {worst:.2f} pixels")
+    return worst
+
+
 def check_geometry(course,out):
     check_kerb_motion(course)
+    reference_error = check_reference(course)
     from strokes import ATLAS, SHAPE_BASE
     glyphs=(out/"glyphs.bin").read_bytes()
     table=(out/"shapes.bin").read_bytes()
@@ -407,7 +430,7 @@ def check_geometry(course,out):
                         hi=2*p+w+((2*dx+v-w)*y+4)//8-8*offset
                         require(hi>lo and line==((1<<(hi-lo))-1)<<lo,
                                 f"{course} split kerb or lane dash in {key} on line {y}")
-    return f"256 poses x 241 steering positions, {len(seen)} lossless paint shapes"
+    return f"256 poses x 241 steering positions, {len(seen)} lossless paint shapes, max reference error {reference_error:.2f} px"
 
 
 def main():
