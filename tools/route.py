@@ -109,8 +109,8 @@ def at_distance(samples, z):
     return Section(z, a.y+t*(b.y-a.y), a.x+t*(b.x-a.x))
 
 
-def drift(step, course):
-    turn = profile(step+TYRES, course)[1]
-    if abs(turn) < .085 or (abs(turn) < .265 and step % 2):
-        return 0
-    return -1 if turn > 0 else 1
+def drift(pose, course):
+    """Lateral push for one quarter-station, sampled at the tyres."""
+    _, turn = profile(pose / 4 + TYRES, course)
+    magnitude = int(abs(turn) > .085) + int(abs(turn) > .32)
+    return -magnitude if turn > 0 else magnitude

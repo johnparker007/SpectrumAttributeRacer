@@ -128,7 +128,14 @@ endCalibration:
     di : pop de
     ; Hold each latch in horizontal blanking. The final latch remains active
     ; through the whole last paper scanline before returning to the HUD page.
-    ld de,1762 : or a : sbc hl,de : ld (rasterDelay+1),hl
+    ld de,1762 : or a : sbc hl,de
+    ; The +2A top-border writers can measure either 33 or 34 delay loops
+    ; depending on the instruction that accepted the calibration interrupt.
+    ; Use the earlier slot: one extra loop puts the first real burst store
+    ; into ULA contention. The 128K and grey +2 measure a longer delay.
+    ld a,l : cp 34 : jr nz,.storeDelay : dec hl
+.storeDelay:
+    ld (rasterDelay+1),hl
     ld hl,irqEntry : ld (irq+1),hl
     xor a : ld (ready),a
     exx : pop hl : pop de : pop bc : exx
@@ -188,6 +195,16 @@ prepare:
         endif
         ld (bc),a : inc c : add hl,de
     edup
+    ; The two halves of this page hold integer and fractional steering offsets
+    ; in two-pixel units. Round only after adding each endpoint residue.
+    xor a : sub e : ld e,a : ld a,0 : sbc a,d : ld d,a
+    ld hl,256 : ld bc,roadShift
+.shiftTable:
+    ld a,h : ld (bc),a : set 7,c : ld a,l : ld (bc),a : res 7,c
+    add hl,de : inc c : ld a,c : cp 34 : jr nz,.scaleReady
+    push de : ld de,-128 : add hl,de : pop de
+.scaleReady:
+    cp 113 : jr nz,.shiftTable
     ld hl,sceneData+3 : ld de,(drawingDepth) : ld a,(sceneData) : ld b,a : ld a,64
 .sky: ld (de),a : inc de : djnz .sky
     ld iy,(drawingDepth) : ld de,LINES-1 : add iy,de
@@ -202,13 +219,19 @@ prepare:
     ld a,(sceneData+2) : ld l,a : ld h,0 : ld de,sceneData+3 : add hl,de
     push hl : ld a,(sceneData) : and #f8 : rrca : rrca : ld l,a : ld h,0
     ld de,bandMeta : add hl,de : push hl : pop iy : pop hl
-    ld a,(sceneData+1) : inc a : ld b,a : ld ix,projected : ld d,high halfShifts
+    ld a,(sceneData+1) : inc a : ld b,a : ld ix,projected
 .project:
-    ld a,(iy) : ld (ix),a : and 127 : ld e,a : ld a,(de) : ld c,a
+    ld a,(iy) : ld (ix),a : and 127 : ld e,a : ld d,high roadShift
+    ld a,(de) : ld c,a : set 7,e : ld a,(de) : ld e,a
+    ld d,(hl) : inc hl
     dup 3,i
-        ld a,(hl) : sub c : ld (ix+i+1),a : inc hl
+        ld a,d : and #c0 : add a,e : ld a,(hl) : adc a,c : ld (ix+i+1),a
+        inc hl : rlc d : rlc d
     edup
-    ld a,(iy+1) : ld (ix+4),a : inc iy : inc iy : ld de,5 : add ix,de : ld d,high halfShifts
+    bit 7,(ix) : jr nz,.fine
+    res 0,(ix+1) : res 0,(ix+2) : res 0,(ix+3)
+.fine:
+    ld a,(iy+1) : ld (ix+4),a : inc iy : inc iy : ld de,5 : add ix,de
     djnz .project
     ld (objectsPtr+2),hl
     ld hl,(poolBase) : ld de,(poolSpare) : ld (poolSpare),hl : ld (poolBase),de : ld (poolNext),de
@@ -632,6 +655,7 @@ digits: incbin "digits.bin"
     align 256
 halfShifts: ds 128
     align 256
+roadShift: ds 256
 attr0: incbin "attr0.bin"
     align 256
 attr1: incbin "attr1.bin"

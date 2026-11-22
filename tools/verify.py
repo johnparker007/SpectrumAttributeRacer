@@ -12,7 +12,7 @@ import tempfile
 from build import BUILD, executable
 from course import ATTRS, riders
 from kerbs import FIRST, LINES, bands, nearest, projected, ribbons, surface
-from route import COURSES, DASH
+from route import COURSES, DASH, drift
 from strokes import object_cells
 
 FRAME, LINE = 70908, 228
@@ -160,8 +160,8 @@ def compare_capture(raw,course,states):
     return start,count
 
 
-def check_timing(emu,model,image,s):
-    ev=trace(emu,image,model,8,s,[("irq","TSTATESP"),("burstOut","TSTATES"),("tailOut","TSTATES")])
+def check_timing(emu,model,image,s,seconds=8,spool=None):
+    ev=trace(emu,image,model,seconds,s,[("irq","TSTATESP"),("burstOut","TSTATES"),("tailOut","TSTATES")],spool)
     groups=[]
     for k,v in ev:
         if k=="irq": groups.append([])
@@ -221,7 +221,28 @@ def check_controls(emu,model,image,s,folder):
     require(any(v%256==1 and v>=256 for _,v in ev),f"{model} missed collision")
 
 
+def check_kerb_motion(course):
+    # These scanlines reversed direction repeatedly through the same bend.
+    # Isolate the camera from player input while keeping the game's curve drift.
+    cases = ([(239, 128, 137, 0, True), (184, 128, 84, 0, False)]
+             if course == "coast" else [(182, 155, 152, 1, True)])
+    for first_pose, lane, y, side, drifting in cases:
+        positions = []
+        for step in range(5):
+            pose = (first_pose + step) % 256
+            if step and drifting:
+                lane = max(8, min(248, lane + drift(pose, course)))
+            crest, points = bands(pose, course)
+            band = (y - FIRST)//8 - crest//8
+            a, b = (projected(point, lane)[side] for point in points[band:band+2])
+            positions.append(2*(a-64) + (2*(b-a)*(y % 8)+4)//8)
+        distance = sum(abs(b-a) for a, b in zip(positions, positions[1:]))
+        require(distance == abs(positions[-1]-positions[0]),
+                f"{course} kerb reversed at scanline {y}, pose {first_pose}: {positions}")
+
+
 def check_geometry(course,out):
+    check_kerb_motion(course)
     from strokes import ATLAS, SHAPE_BASE
     glyphs=(out/"glyphs.bin").read_bytes()
     table=(out/"shapes.bin").read_bytes()
@@ -286,6 +307,13 @@ def main():
             with tempfile.TemporaryDirectory(prefix=f"racer-{model}-") as directory:
                 folder=Path(directory)
                 print(course,model,check_timing(emu,model,image,s),flush=True)
+                if course == "ridge" and model == "P2A41":
+                    # A large change at the entry to this bend uses the in-raster
+                    # bitmap writer and exposes a late +2A calibration slot.
+                    peak = fixture(folder,"burst",image,s,pose=239,lane=128,displayLane=128,gear=4,travel=13)
+                    steering = folder/"burst-keys.txt"
+                    steering.write_bytes(b"p oo pp oo pp " * 12)
+                    print(course,model,"burst",check_timing(emu,model,peak,s,20,steering),flush=True)
                 result,_,_=check_drive(emu,model,image,s,course,folder,180)
                 print(course,model,result,flush=True)
                 check_controls(emu,model,image,s,folder)

@@ -74,6 +74,15 @@ def section(frame, top, y):
     return x, max(3, width)
 
 
+def smooth_camera_positions(column):
+    # The triangular window wraps at the finish line and preserves linear motion.
+    bounded = bounded_lap(column, 4)
+    weights = (1, 2, 3, 4, 5, 4, 3, 2, 1)
+    return [sum(w * bounded[(pose+offset) % len(bounded)]
+                for offset, w in enumerate(weights, -4)) / 25
+            for pose in range(len(bounded))]
+
+
 @lru_cache(maxsize=2)
 def lap_bands(course):
     frames = circuit_surface(course)
@@ -91,11 +100,11 @@ def lap_bands(course):
             x, w = ((a + 2*b + c)/4 for a, b, c in zip(*samples))
             for column, value in zip(columns, (x-w-exact_width, x+w+1, x)):
                 column.append(value)
-        filtered = [bounded_lap(column, 4) for column in columns]
+        filtered = [smooth_camera_positions(column) for column in columns]
         painted = y + FIRST >= FOREGROUND
         grid = 2 if painted else 4
         for pose, values in enumerate(zip(*filtered)):
-            left, right, mark = (grid//2 * nearest(v/grid) + 64 for v in values)
+            left, right, mark = (nearest(2*v) + 256 for v in values)
             controls_by_pose[pose].append((scale, left, right, mark, width, painted, grid))
     return [(top, points[top//8:]) for top, points in zip(first, controls_by_pose)]
 
@@ -106,10 +115,13 @@ def bands(pose, course):
 
 def projected(point, lane):
     scale, left, right, mark, width, _, grid = point
-    shift = (128 + scale * nearest((lane-128) * 128/112)) // 256
-    if grid == 4:
-        shift = (shift+1)//2 * 2
-    return left-shift, right-shift, mark-shift, width
+    shift = scale * nearest((lane-128) * 128/112)
+    # Coordinates are half-pixels. Combine the camera offset and the course
+    # coordinate before snapping the result to the native stroke grid.
+    unit = grid // 2
+    def position(value):
+        return ((64*value - shift + 128*unit) // (256*unit)) * unit
+    return position(left), position(right), position(mark), width
 
 
 def ribbons(a, b, lane):

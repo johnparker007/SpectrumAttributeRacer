@@ -127,7 +127,8 @@ def compile_scene(out, course):
             table = 0 if i == len(points) - 1 else 2 * pairs.index((width, points[i+1][4]))
             j = 2 * (first // 8 + i)
             meta[j:j+2] = bytes((scale | (128 if painted else 0), table))
-            record.extend((left, right, mark))
+            fractions = ((left & 3) << 6) | ((right & 3) << 4) | ((mark & 3) << 2)
+            record.extend((fractions, left >> 2, right >> 2, mark >> 2))
         objects = object_cells(pose, course)
         record.append(len(objects))
         for scale, cells in objects:
@@ -151,7 +152,7 @@ def compile_scene(out, course):
         address = 0xc000 + len(pages[page])
         pages[page].extend(records[pose])
         assert len(pages[page]) <= limits[page], f"{course} overflows course bank {page}"
-        steering = drift(pose // 4, course) * (1 if pose % 2 else 2)
+        steering = drift(pose, course)
         index[pose] = f"    dw {address}\n    db {16+page},{steering & 255}"
     for page, data in pages.items():
         (out / f"page{page}.bin").write_bytes(data)
