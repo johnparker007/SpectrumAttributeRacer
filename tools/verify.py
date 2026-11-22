@@ -286,12 +286,45 @@ def check_controls(emu,model,image,s,folder):
     require(len({x%256 for _,x in ev})>=2 and len({x//256 for _,x in ev})>4,f"{model} O/P/Q/A path")
     collision=fixture(folder,"contact",image,s,pose=123,gear=4,lane=78,displayLane=78)
     ev=trace(emu,collision,model,3,s,[("tick",peek("gear")+"+256*"+peek("bump"))])
-    require(any(v%256==1 and v>=256 for _,v in ev),f"{model} missed collision")
+    require(any(v%256==4 and v>=256 for _,v in ev),f"{model} missed collision")
+
+    # Hold Q at the verge and through an overtake. Check the stripe phase too:
+    # a speed penalty can leave the displayed gear untouched.
+    spool.write_bytes(b"q"*100)
+    state = peek("gear")+"+256*"+peek("phase")+"+8192*"+peek("bump")
+    for name, lane in (("verge",8), ("rival",78)):
+        ride = fixture(folder,name,image,s,pose=123,lane=lane,displayLane=lane,gear=2)
+        ev = trace(emu,ride,model,7,s,[("tick",state)],spool)
+        samples = [value for _, value in ev]
+        first = next((i for i,v in enumerate(samples) if v % 256 == 4),len(samples))
+        top = samples[first:]
+        require(len(top) > 50 and all(v % 256 == 4 for v in top),
+                f"{model} lost top gear on {name}")
+        require(all(((b//256-a//256) % 32) == 4 for a,b in zip(top,top[1:])),
+                f"{model} lost wheel speed on {name}")
+        if name == "rival":
+            require(any(v//8192 for v in samples), f"{model} missed held-Q contact fixture")
 
 
 def check_kerb_motion(course):
     # These scanlines reversed direction repeatedly through the same bend.
     # Isolate the camera from player input while keeping the game's curve drift.
+    for initial_lane in (8,64,128,192,248):
+        lane = initial_lane
+        previous = None
+        for step in range(257):
+            pose = step % 256
+            if step:
+                lane = max(8, min(248, lane + drift(pose, course)))
+            crest, points = bands(pose, course)
+            a,b = (projected(p,lane) for p in points[:2])
+            # Measure at the actual (moving) first visible scanline.
+            edges = [2*(a[i]-64) + (2*(b[i]-a[i])*(crest%8)+4)//8 for i in (0,1)]
+            centre = (sum(edges)+a[3])/2
+            if previous is not None:
+                require(abs(centre-previous) <= 3, f"{course} horizon jumped at pose {pose}")
+            previous = centre
+
     cases = ([(239, 128, 137, 0, True), (184, 128, 84, 0, False)]
              if course == "coast" else [(182, 155, 152, 1, True)])
     for first_pose, lane, y, side, drifting in cases:

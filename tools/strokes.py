@@ -123,11 +123,11 @@ def compile_scene(out, course):
         first, points = bands(pose, course)
         levels = depth_data(surface(pose, course))
         record = bytearray((first, len(points) - 1, len(levels))) + levels
-        for i, (scale, left, right, mark, width, painted, _) in enumerate(points):
+        for i, (scale, left, right, mark, width, painted, grid) in enumerate(points):
             table = 0 if i == len(points) - 1 else 2 * pairs.index((width, points[i+1][4]))
             j = 2 * (first // 8 + i)
             meta[j:j+2] = bytes((scale | (128 if painted else 0), table))
-            fractions = ((left & 3) << 6) | ((right & 3) << 4) | ((mark & 3) << 2)
+            fractions = ((left & 3) << 6) | ((right & 3) << 4) | ((mark & 3) << 2) | int(grid == 4)
             record.extend((fractions, left >> 2, right >> 2, mark >> 2))
         objects = object_cells(pose, course)
         record.append(len(objects))

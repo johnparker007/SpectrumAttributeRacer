@@ -188,11 +188,9 @@ showState:
     ret
 
 tick:
-    ld a,(lane) : cp 18 : jr c,.verge : cp 239 : jr c,.speed
-.verge: ld a,1 : ld (gear),a
-.speed:
-    ld a,(phase) : ld hl,gear : add a,(hl) : and 31 : ld (phase),a
-    ld a,(travel) : add a,(hl) : cp SUBSTEP_TRAVEL : jr c,.store
+    ld a,(gear) : ld b,a
+    ld a,(phase) : add a,b : and 31 : ld (phase),a
+    ld a,(travel) : add a,b : cp SUBSTEP_TRAVEL : jr c,.store
     sub SUBSTEP_TRAVEL : ld (travel),a : ld a,1 : ld (forward),a : jr .request
 .store: ld (travel),a
     ld a,(lane) : ld hl,displayLane : cp (hl) : jr nz,.request
@@ -265,14 +263,15 @@ prepare:
 .project:
     ld a,(iy) : ld (ix),a : add a,a : ld e,a : ld d,high roadShift
     ld a,(de) : ld c,a : inc e : ld a,(de) : ld e,a
-    ld a,(ix) : cpl : and 128 : sub c : ld c,a
-    ld a,1 : sbc a,e : ld e,c : ld c,a
     ld d,(hl) : inc hl
+    ld a,d : and 1 : rrca : sub c : ld c,a
+    ld a,1 : sbc a,e : ld e,c : ld c,a
     dup 3,i
         ld a,d : and #c0 : add a,e : ld a,(hl) : adc a,c : ld (ix+i+1),a
         inc hl : rlc d : rlc d
     edup
-    bit 7,(ix) : jr nz,.fine
+    ; Six rotations leave the saved coarse-grid flag in bit 6.
+    bit 6,d : jr z,.fine
     res 0,(ix+1) : res 0,(ix+2) : res 0,(ix+3)
 .fine:
     ld a,(iy+1) : ld (ix+4),a : inc iy : inc iy : ld de,5 : add ix,de
@@ -665,7 +664,7 @@ judgePass:
     ld b,186
 .left:
     ld a,(lane) : sub b : add a,12 : cp 25 : jr nc,.clear
-    ld a,1 : ld (gear),a : ld a,20 : ld (bump),a : ret
+    ld a,20 : ld (bump),a : ret
 .clear:
     ld a,(passes) : add a,1 : daa : ld (passes),a : ret
 

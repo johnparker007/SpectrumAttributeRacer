@@ -87,6 +87,10 @@ def smooth_camera_positions(column):
 def lap_bands(course):
     frames = circuit_surface(course)
     first = [next(i for i, row in enumerate(frame) if row) for frame in frames]
+    # Follow the first visible road line as it rises and falls over crests.
+    # A fixed-screen-row filter alone samples different depths on the next pose.
+    tips = [frame[top][0] for frame, top in zip(frames, first)]
+    tips = bounded_lap(tips, 1)
     controls_by_pose = [[] for _ in frames]
     for y in range(0, LINES+1, 8):
         scale = camera_scale(y + FIRST)
@@ -95,15 +99,23 @@ def lap_bands(course):
         exact_width = 2.25 + 19.75 * scale / 140
         width = max(4, 2 * nearest(exact_width/2))
         columns = [[], [], []]
-        for frame, top in zip(frames, first):
+        for frame, top, tip in zip(frames, first, tips):
             samples = [section(frame, top, y+dy) for dy in (-8, 0, 8)]
             x, w = ((a + 2*b + c)/4 for a, b, c in zip(*samples))
+            # Keep the first band tangent to the distant heading. Blend back
+            # into the ordinary projected curve before the foreground.
+            distance = max(0, y - top - 8)
+            blend = min(1.0, distance / 48)
+            # At foreground depth the original projected position is authoritative.
+            near = min(1.0, max(0, (FIRST+y-88)/48))
+            weight = max(near*near*(3-2*near), blend*blend*(3-2*blend))
+            x = tip * (1-weight) + x*weight
             for column, value in zip(columns, (x-w-exact_width, x+w+1, x)):
                 column.append(value)
         filtered = [smooth_camera_positions(column) for column in columns]
         painted = y + FIRST >= FOREGROUND
-        grid = 2 if painted else 4
         for pose, values in enumerate(zip(*filtered)):
+            grid = 2 if painted or y <= first[pose]+8 else 4
             left, right, mark = (nearest(2*v) + 256 for v in values)
             controls_by_pose[pose].append((scale, left, right, mark, width, painted, grid))
     return [(top, points[top//8:]) for top, points in zip(first, controls_by_pose)]
