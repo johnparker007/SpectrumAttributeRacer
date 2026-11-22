@@ -1,5 +1,25 @@
 # Spectrum Attribute Racer
 
+## Flat Run for the Spectrum 128K
+
+Open [Flat Run](play/flat-run.tap) in 128K, +2 or +2A mode. The ride starts on the opening straight in second gear. The four number keys recall the Python prototype's reference views and pause travel for inspection.
+
+| Key | Action |
+| --- | --- |
+| 1 / 2 | Opening straight / coastal right |
+| 3 / 4 | Desert right / desert left |
+| Space | Ride / pause |
+| O / P | Move directly left / right, including while paused |
+| Q / A | Increase / decrease speed through four gears |
+
+![Four Flat Run frames captured in the 128K emulator](docs/flat-spectrum.png)
+
+The build samples the Python camera at 1,024 distances around the lap and at all 80 road scanlines. It packs repeated centreline steps, subpixel-aligned road strips, steering offsets, and stripe-dependent ULA colour tables into banked RAM. The Z80 composites the hidden screen and displays the completed image at vertical blank. The kerbs use pixel-resolution geometry. Each eight-by-eight cell shares two colours. Scenery uses an eight-pixel horizontal grid and seven object sizes.
+
+Build with `python tools/build.py --course flat`. Test the tape from ROM startup with `python tools/verify_flat.py --model 128k --tape` (also `P2` and `P2A41`). The test drives the keyboard and checks consecutive emulator frames against a separate scanline rasterisation of the Python road at Spectrum precision. Build products are in `build/flat-native/`.
+
+## Coast Run and Ridge Run
+
 Two motorcycle circuits for the ZX Spectrum 128K. The camera follows the bike from behind. Steer to move the road under the tyres, watch for riders coming back into view over crests, and pass on either side. Speed is controlled entirely by Q and A during renderer testing. Crossing the verge or touching another rider preserves both gear and speed. Each clean overtake adds one to the dashboard counter.
 
 | Circuit | Ride | Emulator capture |
@@ -20,7 +40,7 @@ Open either TAP with tape autoload on a 128K Spectrum, +2 or +2A emulator. Enabl
 
 ## Flat-road Python prototype
 
-Double-click `Preview-Road.bat` or run `python tools/preview_flat.py`. This is the PC-only Hang-On appearance study. Choose one of four camera positions drawn from the supplied references. Each opens paused. Space starts or stops travel, O/P or the arrow keys move directly across the road, and the Lap slider scrubs the circuit. Toggle Rider to inspect the kerbs. The Speed slider changes the distance travelled per second.
+Double-click `Preview-Road.bat` or run `python tools/preview_flat.py`. This is the floating-point master for the flat circuit. Choose one of four camera positions drawn from the supplied references. Each opens paused. Space starts or stops travel, O/P or the arrow keys move directly across the road, and the Lap slider scrubs the circuit. Toggle Rider to inspect the kerbs. The Speed slider changes the distance travelled per second.
 
 The horizon is fixed. A flat-plane perspective projection sets the width and depth of every scanline. The renderer integrates the curvature of the upcoming track relative to the camera heading. Paint and roadside objects use the same distance as the road. Edit `tools/flat_road.py` to tune the track, camera and colours. The comparison below shows the opening straight and coastal right above the desert right and left.
 
@@ -41,7 +61,7 @@ python tools/build.py
 python tools/verify.py
 ```
 
-Both commands accept `--course coast` or `--course ridge`. The verifier also accepts `--model 128k`, `--model P2` or `--model P2A41`. Set `SJASMPLUS` and `ZESARUX` to the tool paths if needed, or pass `--assembler <path>` and `--emulator <path>` respectively. The build writes a TAP, an instant-start SNA and a symbol map for each circuit in `build/` (Coast Run) and `build/ridge/` (Ridge Run). On Windows, `Build-TAP.bat` also rebuilds both.
+Both commands accept `--course coast` or `--course ridge`. The verifier also accepts `--model 128k`, `--model P2` or `--model P2A41`. Set `SJASMPLUS` and `ZESARUX` to the tool paths if needed, or pass `--assembler <path>` and `--emulator <path>` respectively. The build writes a TAP, an instant-start SNA and a symbol map for each circuit in `build/` (Coast Run) and `build/ridge/` (Ridge Run). On Windows, `Build-TAP.bat` rebuilds all three tapes.
 
 ## How the road works
 

@@ -87,8 +87,12 @@ def build(assembler, out=BUILD, course="coast"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--assembler", type=Path)
-    parser.add_argument("--course", choices=COURSES)
+    parser.add_argument("--course", choices=(*COURSES,"flat"))
     args = parser.parse_args()
     assembler = executable(args.assembler,"SJASMPLUS","sjasmplus","Desktop/_temp/sjasmplus-1.20.2.win/sjasmplus.exe")
-    for course in ([args.course] if args.course else COURSES):
-        build(assembler, BUILD if course == "coast" else BUILD/course, course)
+    for course in ([args.course] if args.course else (*COURSES,"flat")):
+        if course=="flat":
+            from build_flat import build as build_flat
+            build_flat(assembler)
+        else:
+            build(assembler, BUILD if course == "coast" else BUILD/course, course)

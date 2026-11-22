@@ -6,6 +6,10 @@ from math import cos, pi, sin, floor, ceil
 
 W, H, SKY = 344, 240, 137
 NEAR, FAR = 4., 180.
+LANE_SCALE = 188
+KERB_RATIO = .19
+STRIPE_LENGTH = .72
+LANDMARK_SPACING, LANDMARK_OFFSET = 12, 9.5
 # Integrated lateral curvature. Constant stretches are long enough to study
 # the same turn at several speeds, then ease into a straight or a reversal.
 KNOTS = ((0,0.),(225,0.),(310,.52),(550,.52),(665,0.),(735,0.),
@@ -41,9 +45,21 @@ def path(s):
     return PATH[i]+t*(HEADING[i]+.5*t*TURN[i]), HEADING[i]+t*TURN[i]
 
 
-def depth(y):
-    t = (y-SKY)/(H-1-SKY)
+def depth_at_fraction(t):
     return 1/(1/FAR+t*(1/NEAR-1/FAR))
+
+
+def depth(y):
+    return depth_at_fraction((y-SKY)/(H-1-SKY))
+
+
+def line_width(halfwidth):
+    return max(.4,halfwidth*.019)
+
+
+def landmark_offset(station,halfwidth):
+    return (-1 if station%3==1 else 1)*halfwidth*(1.42+.12*(station%2))
+
 
 
 DEPTHS = tuple(depth(y) for y in range(SKY,H))
@@ -65,7 +81,7 @@ class Camera:
         # A finite draw distance compresses the remote sweep. The heading
         # at the tyres anchors the near road while the far bend swings away.
         bend = 6.3*(self.angle(z)-self.near_angle)*(1-NEAR/z)/(1+z/40)
-        return W/2+bend-self.lane*188*t, 2+188*t, t
+        return W/2+bend-self.lane*LANE_SCALE*t, 2+LANE_SCALE*t, t
 
 
 def rgb(value):
@@ -206,24 +222,23 @@ def render(s,lane,theme,show_bike=True):
     for y,z in enumerate(DEPTHS,SKY):
         x,w,t=camera.section(z)
         # World-space paint travels towards the rider as distance advances.
-        band=floor((camera.s+z)/.72)
+        band=floor((camera.s+z)/STRIPE_LENGTH)
         stripe=red if band%2 else cream
-        edge=.19*w
-        line=max(.4,w*.019)
+        edge=KERB_RATIO*w
+        line=line_width(w)
         span(image,y,x-w-edge,x+w+edge,stripe)
         span(image,y,x-w,x+w,road_b if band%2 else road_a)
         span(image,y,x-w,x-w+line,white)
         span(image,y,x+w-line,x+w,white)
-        if theme=='Coast' and floor((camera.s+z)/1.44)%2==0:
+        if theme=='Coast' and floor((camera.s+z)/(2*STRIPE_LENGTH))%2==0:
             span(image,y,x-line*.48,x+line*.48,white)
     # Objects are anchored in the same world and projection as the kerbs.
-    spacing, offset = 12, 9.5
+    spacing, offset = LANDMARK_SPACING, LANDMARK_OFFSET
     for i in range(floor((camera.s+FAR-offset)/spacing),floor((camera.s+NEAR-offset)/spacing),-1):
         z=i*spacing+offset-camera.s
         x,w,t=camera.section(z)
-        side=-1 if i%3==1 else 1
         scale=NEAR/z*(2.1 if theme=='Desert' else 3.55)
-        landmark(image,x+side*w*(1.42+.12*(i%2)),SKY+t*(H-1-SKY),scale,theme=='Desert')
+        landmark(image,x+landmark_offset(i,w),SKY+t*(H-1-SKY),scale,theme=='Desert')
     if show_bike:
         bike(image,W/2,H-1,1.,max(-1,min(1,curvature(camera.s+5)*.92)))
     return bytes(image)
